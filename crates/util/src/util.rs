@@ -2,6 +2,7 @@
 extern crate self as util;
 
 #[cfg(not(target_family = "wasm"))]
+pub mod bench_stats;
 pub mod archive;
 #[cfg(not(target_family = "wasm"))]
 pub mod command;

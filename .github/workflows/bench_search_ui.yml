@@ -1,0 +1,41 @@
+name: Measure project search main-thread costs
+on:
+  push:
+    branches:
+      - bench-search-ui
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Install Linux dependencies
+        run: ./script/linux
+      - name: Clone the Linux kernel
+        run: git clone --quiet --depth 1 https://github.com/torvalds/linux "$RUNNER_TEMP/linux"
+      - name: Build search tests
+        run: cargo test -p search --release --lib --no-run
+      - name: Measure
+        shell: bash
+        run: |
+          export SEARCH_BENCH_ROOT="$RUNNER_TEMP/linux"
+          export SEARCH_BENCH_QUERIES="static,kmalloc_array,vmx_l1d_should_flush"
+          for run in 1 2; do
+            echo "=== run $run, batched git loads"
+            cargo test -p search --release --lib bench_real_project_search -- --nocapture --test-threads 1 2>&1 | grep -E "^(scan|query|  )"
+            echo "=== run $run, unbatched git loads"
+            ZED_NO_COMMITTED_TEXT_BATCH=1 cargo test -p search --release --lib bench_real_project_search -- --nocapture --test-threads 1 2>&1 | grep -E "^(scan|query|  )"
+          done | tee results.txt
+          { echo '```'; cat results.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

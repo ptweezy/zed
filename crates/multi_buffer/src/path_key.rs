@@ -331,6 +331,7 @@ impl MultiBuffer {
     where
         T: language::ToOffset,
     {
+        let _timer = util::bench_stats::timer("multibuffer.set_merged_excerpt_ranges_for_path");
         let anchor_ranges = new
             .into_iter()
             .map(|r| ExcerptRange {

@@ -220,6 +220,98 @@ fn pending_hunks(
         .collect()
 }
 
+struct CommittedTextLoad {
+    buffer_id: BufferId,
+    repo_path: RepoPath,
+    result_tx: oneshot::Sender<Result<DiffBasesChange>>,
+}
+
+async fn load_committed_texts(state: RepositoryState, loads: Vec<CommittedTextLoad>) {
+    match state {
+        RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+            // `git cat-file --batch` reads one revision per line, so these paths can't share the process.
+            let (loads, unbatchable): (Vec<_>, Vec<_>) = loads
+                .into_iter()
+                .partition(|load| !load.repo_path.as_unix_str().contains('\n'));
+            for load in unbatchable {
+                load.result_tx
+                    .send(Err(anyhow!(
+                        "path {:?} contains a newline",
+                        load.repo_path.as_unix_str()
+                    )))
+                    .ok();
+            }
+            if loads.is_empty() {
+                return;
+            }
+            let revisions = loads
+                .iter()
+                .flat_map(|load| {
+                    let path = load.repo_path.as_unix_str();
+                    [format!("HEAD:{path}"), format!(":{path}")]
+                })
+                .collect();
+            match backend.load_revisions(revisions).await {
+                Ok(texts) => {
+                    let mut texts = texts.into_iter();
+                    for load in loads {
+                        let committed_text = texts.next().flatten();
+                        let staged_text = texts.next().flatten();
+                        load.result_tx
+                            .send(diff_bases_change_from_texts(committed_text, staged_text))
+                            .ok();
+                    }
+                }
+                Err(error) => {
+                    for load in loads {
+                        load.result_tx.send(Err(anyhow!("{error:#}"))).ok();
+                    }
+                }
+            }
+        }
+        RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+            use proto::open_uncommitted_diff_response::Mode;
+
+            for load in loads {
+                let result = async {
+                    let response = client
+                        .request(proto::OpenUncommittedDiff {
+                            project_id: project_id.to_proto(),
+                            buffer_id: load.buffer_id.to_proto(),
+                        })
+                        .await?;
+                    let mode = Mode::try_from(response.mode).ok().context("Invalid mode")?;
+                    Ok(match mode {
+                        Mode::IndexMatchesHead => DiffBasesChange::SetBoth(response.committed_text),
+                        Mode::IndexAndHead => DiffBasesChange::SetEach {
+                            head: response.committed_text,
+                            index: response.staged_text,
+                        },
+                    })
+                }
+                .await;
+                load.result_tx.send(result).ok();
+            }
+        }
+    }
+}
+
+fn diff_bases_change_from_texts(
+    committed_text: Option<Vec<u8>>,
+    staged_text: Option<Vec<u8>>,
+) -> Result<DiffBasesChange> {
+    let committed_text = committed_text.map(decode_git_text).transpose()?;
+    let staged_text = staged_text.map(decode_git_text).transpose()?;
+    Ok(if committed_text == staged_text {
+        DiffBasesChange::SetBoth(committed_text)
+    } else {
+        DiffBasesChange::SetEach {
+            index: staged_text,
+            head: committed_text,
+        }
+    })
+}
+
 fn decode_git_text(bytes: Vec<u8>) -> Result<String> {
     let text = decode_text(bytes)?.text;
     anyhow::ensure!(
@@ -702,6 +794,7 @@ pub struct Repository {
     job_debug_queue: job_debug_queue::GitJobDebugQueue,
     pending_ops: SumTree<PendingOps>,
     job_id: JobId,
+    pending_committed_text_loads: HashMap<JobId, Vec<CommittedTextLoad>>,
     askpass_delegates: RemoteAskPassDelegates,
     latest_askpass_id: u64,
     repository_state: Shared<Task<Result<RepositoryState, String>>>,
@@ -6594,6 +6687,7 @@ impl Repository {
             latest_askpass_id: 0,
             job_sender: mpsc::unbounded().0,
             job_id: 0,
+            pending_committed_text_loads: HashMap::default(),
             active_jobs: Default::default(),
             job_debug_queue: job_debug_queue::GitJobDebugQueue::new(),
             initial_graph_data: Default::default(),
@@ -6649,6 +6743,7 @@ impl Repository {
             active_jobs: Default::default(),
             job_debug_queue: job_debug_queue::GitJobDebugQueue::new(),
             job_id: 0,
+            pending_committed_text_loads: HashMap::default(),
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
@@ -10327,7 +10422,7 @@ impl Repository {
         cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
     }
 
-    fn load_committed_text(
+    fn load_committed_text_unbatched(
         &mut self,
         buffer_id: BufferId,
         repo_path: RepoPath,
@@ -10384,6 +10479,44 @@ impl Repository {
         });
 
         cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
+    }
+
+    fn load_committed_text(
+        &mut self,
+        buffer_id: BufferId,
+        repo_path: RepoPath,
+        cx: &App,
+    ) -> Task<Result<DiffBasesChange>> {
+        if std::env::var_os("ZED_NO_COMMITTED_TEXT_BATCH").is_some() {
+            return self.load_committed_text_unbatched(buffer_id, repo_path, cx);
+        }
+        let (result_tx, result_rx) = oneshot::channel();
+        let load = CommittedTextLoad {
+            buffer_id,
+            repo_path,
+            result_tx,
+        };
+        // Joining only the most recently queued job keeps loads ordered with other git jobs.
+        let last_job_id = self.job_id.wrapping_sub(1);
+        if let Some(loads) = self.pending_committed_text_loads.get_mut(&last_job_id) {
+            loads.push(load);
+        } else {
+            let job_id = self.job_id;
+            self.pending_committed_text_loads.insert(job_id, vec![load]);
+            let this = self.this.clone();
+            self.send_job("load_committed_text", None, move |state, mut cx| async move {
+                let loads = this
+                    .update(&mut cx, |this, _| {
+                        this.pending_committed_text_loads.remove(&job_id)
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                load_committed_texts(state, loads).await;
+            });
+        }
+
+        cx.spawn(|_: &mut AsyncApp| async move { result_rx.await? })
     }
 
     pub fn load_commit_template_text(

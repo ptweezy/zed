@@ -740,6 +740,7 @@ async fn consume_search_stream(
                 // `new_ranges.next().await` likely never gets hit while still pending so `async_task`
                 // will not reschedule, starving other front end tasks, insert a yield point for that here
                 smol::future::yield_now().await;
+                let _timer = util::bench_stats::timer("model.per_buffer_update(incl. observers)");
                 project_search
                     .update(cx, |project_search, cx| {
                         let workspace = project_search.workspace.upgrade();
@@ -2389,6 +2390,7 @@ impl ProjectSearchView {
     }
 
     fn entity_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _timer = util::bench_stats::timer("view.entity_changed");
         let model = self.entity.read(cx);
         let phase = model.phase;
         let concluded_no_results = model.search_state.no_results_so_far();
@@ -6894,6 +6896,52 @@ pub mod tests {
             let query_text = search_view.query_editor.read(cx).text(cx);
             assert_eq!(query_text, "Uppercase_Query");
         });
+    }
+
+
+    #[gpui::test]
+    async fn bench_real_project_search(cx: &mut TestAppContext) {
+        let Some(root) = std::env::var_os("SEARCH_BENCH_ROOT") else {
+            return;
+        };
+        let queries = std::env::var("SEARCH_BENCH_QUERIES").unwrap_or_else(|_| "static".into());
+        init_test(cx);
+        cx.executor().allow_parking();
+        let fs: Arc<dyn fs::Fs> = fs::RealFs::new(None, cx.background_executor.clone());
+        let scan_start = std::time::Instant::now();
+        let project = Project::test(fs, [std::path::Path::new(&root)], cx).await;
+        eprintln!("scan {:?}", scan_start.elapsed());
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        for query in queries.split(',') {
+            let search = cx.new(|cx| ProjectSearch::new(project.clone(), workspace.downgrade(), cx));
+            let search_view = cx.add_window(|window, cx| {
+                ProjectSearchView::new(workspace.downgrade(), search.clone(), window, cx, None)
+            });
+            cx.background_executor.run_until_parked();
+            util::bench_stats::reset();
+            let start = std::time::Instant::now();
+            perform_search(search_view, query, cx);
+            let elapsed = start.elapsed();
+            let (matches, excerpts) = search_view
+                .update(cx, |search_view, _, cx| {
+                    let model = search_view.entity.read(cx);
+                    (
+                        model.match_ranges.len(),
+                        model.excerpts.read(cx).snapshot(cx).excerpts().count(),
+                    )
+                })
+                .unwrap();
+            eprintln!("query {query:?}: {elapsed:?}, matches {matches}, excerpts {excerpts}");
+            eprint!("{}", util::bench_stats::report());
+            search_view
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+            cx.background_executor.run_until_parked();
+        }
     }
 
     fn init_test(cx: &mut TestAppContext) {

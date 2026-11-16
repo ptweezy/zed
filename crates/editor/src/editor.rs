@@ -10102,6 +10102,11 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let _timer = util::bench_stats::timer(match event {
+            multi_buffer::Event::Edited { .. } => "editor.on_buffer_event(Edited)",
+            multi_buffer::Event::BufferRangesUpdated { .. } => "editor.on_buffer_event(BufferRangesUpdated)",
+            _ => "editor.on_buffer_event(other)",
+        });
         match event {
             multi_buffer::Event::Edited {
                 edited_buffer,
