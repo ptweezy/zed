@@ -431,6 +431,7 @@ pub fn parse_worktrees_from_str<T: AsRef<str>>(
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Upstream {
     pub ref_name: SharedString,
+    /// Computed only for the checked-out branch. Other branches are `Tracked` with zero counts.
     pub tracking: UpstreamTracking,
 }
 
@@ -503,7 +504,7 @@ impl RemoteCommandOutput {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct UpstreamTrackingStatus {
     pub ahead: u32,
     pub behind: u32,
@@ -2174,7 +2175,6 @@ impl GitRepository for RealGitRepository {
                     "%(parent)",
                     "%(refname)",
                     "%(upstream)",
-                    "%(upstream:track)",
                     "%(committerdate:unix)",
                     "%(authorname)",
                     "%(contents:subject)",
@@ -2187,7 +2187,15 @@ impl GitRepository for RealGitRepository {
                     "--format",
                     &fields,
                 ];
-                let output = git.build_command(&args).output().await?;
+                // `%(upstream:track)` walks the history of every branch.
+                let head_tracking_args =
+                    ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"];
+                let (output, head_tracking) = futures::future::join(
+                    git.build_command(&args).output(),
+                    git.build_command(&head_tracking_args).output(),
+                )
+                .await;
+                let output = output?;
 
                 let error = if output.status.success() {
                     None
@@ -2199,6 +2207,14 @@ impl GitRepository for RealGitRepository {
 
                 let input = String::from_utf8_lossy(&output.stdout);
                 let mut branches = parse_branch_input(&input)?;
+                if let Some(upstream) = branches
+                    .iter_mut()
+                    .find(|branch| branch.is_head)
+                    .and_then(|head| head.upstream.as_mut())
+                    && let Some(tracking) = parse_head_tracking(head_tracking).log_err()
+                {
+                    upstream.tracking = tracking;
+                }
                 if branches.is_empty() {
                     let args = vec!["symbolic-ref", "--quiet", "HEAD"];
 
@@ -4128,10 +4144,6 @@ fn parse_branch_input(input: &str) -> Result<Vec<Branch>> {
         let Some(upstream_name) = fields.next().map(|f| f.to_string()) else {
             continue;
         };
-        let Some(upstream_tracking) = fields.next().and_then(|f| parse_upstream_track(f).ok())
-        else {
-            continue;
-        };
         let Some(commiterdate) = fields.next().and_then(|f| f.parse::<i64>().ok()) else {
             continue;
         };
@@ -4157,7 +4169,7 @@ fn parse_branch_input(input: &str) -> Result<Vec<Branch>> {
             } else {
                 Some(Upstream {
                     ref_name: upstream_name.into(),
-                    tracking: upstream_tracking,
+                    tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus::default()),
                 })
             },
         })
@@ -4177,32 +4189,17 @@ fn format_branch_scan_error(output: &Output) -> String {
     }
 }
 
-fn parse_upstream_track(upstream_track: &str) -> Result<UpstreamTracking> {
-    if upstream_track.is_empty() {
-        return Ok(UpstreamTracking::Tracked(UpstreamTrackingStatus {
-            ahead: 0,
-            behind: 0,
-        }));
+fn parse_head_tracking(output: std::io::Result<Output>) -> Result<UpstreamTracking> {
+    let output = output?;
+    // `rev-list` fails exactly when `%(upstream:track)` reports the upstream as gone.
+    if !output.status.success() {
+        return Ok(UpstreamTracking::Gone);
     }
-
-    let upstream_track = upstream_track.strip_prefix("[").context("missing [")?;
-    let upstream_track = upstream_track.strip_suffix("]").context("missing [")?;
-    let mut ahead: u32 = 0;
-    let mut behind: u32 = 0;
-    for component in upstream_track.split(", ") {
-        if component == "gone" {
-            return Ok(UpstreamTracking::Gone);
-        }
-        if let Some(ahead_num) = component.strip_prefix("ahead ") {
-            ahead = ahead_num.parse::<u32>()?;
-        }
-        if let Some(behind_num) = component.strip_prefix("behind ") {
-            behind = behind_num.parse::<u32>()?;
-        }
-    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (ahead, behind) = stdout.trim().split_once('\t').context("no tab in output")?;
     Ok(UpstreamTracking::Tracked(UpstreamTrackingStatus {
-        ahead,
-        behind,
+        ahead: ahead.parse()?,
+        behind: behind.parse()?,
     }))
 }
 
@@ -5989,11 +5986,61 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_branches_upstream_tracking(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        git_command(path, ["commit", "--allow-empty", "-m", "first"]);
+        git_command(path, ["branch", "behind_main"]);
+        git_command(path, ["branch", "custom"]);
+        git_command(path, ["branch", "tagged"]);
+        git_command(path, ["branch", "deleted"]);
+        git_command(path, ["commit", "--allow-empty", "-m", "second"]);
+        git_command(path, ["branch", "--set-upstream-to=main", "behind_main"]);
+        git_command(path, ["branch", "--set-upstream-to=deleted", "main"]);
+        git_command(path, ["branch", "-D", "deleted"]);
+        git_command(path, ["update-ref", "refs/custom/main", "main"]);
+        git_command(path, ["config", "branch.custom.remote", "."]);
+        git_command(path, ["config", "branch.custom.merge", "refs/custom/main"]);
+        git_command(path, ["tag", "-a", "v1", "-m", "v1"]);
+        git_command(path, ["remote", "add", "origin", "."]);
+        git_command(path, ["update-ref", "refs/remotes/origin/v1", "v1"]);
+        git_command(path, ["branch", "--set-upstream-to=origin/v1", "tagged"]);
+
+        let repo =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        let behind_by_one = UpstreamTracking::Tracked(UpstreamTrackingStatus {
+            ahead: 0,
+            behind: 1,
+        });
+        for (branch_name, expected_tracking) in [
+            ("behind_main", behind_by_one),
+            ("main", UpstreamTracking::Gone),
+            ("custom", behind_by_one),
+            ("tagged", behind_by_one),
+        ] {
+            git_command(path, ["checkout", branch_name]);
+            let branches = repo.branches().await.unwrap().branches;
+            let head = branches.iter().find(|branch| branch.is_head).unwrap();
+            assert_eq!(head.name(), branch_name);
+            assert_eq!(
+                head.upstream.as_ref().map(|upstream| upstream.tracking),
+                Some(expected_tracking),
+                "{branch_name}"
+            );
+        }
+    }
+
     #[test]
     fn test_branches_parsing() {
         // suppress "help: octal escapes are not supported, `\0` is always null"
         #[allow(clippy::octal_escapes)]
-        let input = "*\0060964da10574cd9bf06463a53bf6e0769c5c45e\0\0refs/heads/zed-patches\0refs/remotes/origin/zed-patches\0\01733187470\0John Doe\0generated protobuf\n";
+        let input = "*\0060964da10574cd9bf06463a53bf6e0769c5c45e\0\0refs/heads/zed-patches\0refs/remotes/origin/zed-patches\01733187470\0John Doe\0generated protobuf\n";
         assert_eq!(
             parse_branch_input(input).unwrap(),
             vec![Branch {
@@ -6020,7 +6067,7 @@ mod tests {
     #[test]
     fn test_branches_parsing_containing_refs_with_missing_fields() {
         #[allow(clippy::octal_escapes)]
-        let input = " \090012116c03db04344ab10d50348553aa94f1ea0\0refs/heads/broken\n \0eb0cae33272689bd11030822939dd2701c52f81e\0895951d681e5561478c0acdd6905e8aacdfd2249\0refs/heads/dev\0\0\01762948725\0Zed\0Add feature\n*\0895951d681e5561478c0acdd6905e8aacdfd2249\0\0refs/heads/main\0\0\01762948695\0Zed\0Initial commit\n";
+        let input = " \090012116c03db04344ab10d50348553aa94f1ea0\0refs/heads/broken\n \0eb0cae33272689bd11030822939dd2701c52f81e\0895951d681e5561478c0acdd6905e8aacdfd2249\0refs/heads/dev\0\01762948725\0Zed\0Add feature\n*\0895951d681e5561478c0acdd6905e8aacdfd2249\0\0refs/heads/main\0\01762948695\0Zed\0Initial commit\n";
 
         let branches = parse_branch_input(input).unwrap();
         assert_eq!(branches.len(), 2);
