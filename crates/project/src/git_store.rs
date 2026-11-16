@@ -71,12 +71,14 @@ use settings::{GitDiffBaseSetting, Settings, SettingsLocation, SettingsStore, Wo
 use smallvec::SmallVec;
 use smol::future::yield_now;
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry},
     future::Future,
     mem,
     ops::Range,
     path::{Path, PathBuf},
+    rc::{Rc, Weak},
     str::FromStr,
     sync::{
         Arc,
@@ -218,6 +220,130 @@ fn pending_hunks(
             )
         })
         .collect()
+}
+
+struct DiffBaseLoad {
+    buffer_id: BufferId,
+    repo_path: RepoPath,
+    kind: DiffBaseLoadKind,
+}
+
+enum DiffBaseLoadKind {
+    /// HEAD and index text.
+    Committed(oneshot::Sender<Result<DiffBasesChange>>),
+    /// Index text.
+    Staged(oneshot::Sender<Result<Option<String>>>),
+}
+
+impl DiffBaseLoadKind {
+    fn fail(self, error: anyhow::Error) {
+        match self {
+            Self::Committed(result_tx) => result_tx.send(Err(error)).ok(),
+            // Unstaged diffs treat an unreadable index entry as a missing one.
+            Self::Staged(result_tx) => result_tx.send(Ok(None)).ok(),
+        };
+    }
+}
+
+async fn load_diff_bases(state: RepositoryState, loads: Vec<DiffBaseLoad>) {
+    match state {
+        RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+            let mut revisions = Vec::new();
+            for load in &loads {
+                let path = load.repo_path.as_unix_str();
+                if let DiffBaseLoadKind::Committed(_) = load.kind {
+                    revisions.push(format!("HEAD:{path}"));
+                }
+                revisions.push(format!(":{path}"));
+            }
+            match backend.load_revisions(revisions).await {
+                Ok(texts) => {
+                    let mut texts = texts.into_iter();
+                    for load in loads {
+                        match load.kind {
+                            DiffBaseLoadKind::Committed(result_tx) => {
+                                let committed_text = texts.next().flatten();
+                                let staged_text = texts.next().flatten();
+                                result_tx
+                                    .send(diff_bases_change_from_texts(committed_text, staged_text))
+                                    .ok();
+                            }
+                            DiffBaseLoadKind::Staged(result_tx) => {
+                                let staged_text = texts.next().flatten();
+                                result_tx
+                                    .send(staged_text.map(decode_git_text).transpose())
+                                    .ok();
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    for load in loads {
+                        load.kind.fail(anyhow!("{error:#}"));
+                    }
+                }
+            }
+        }
+        RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+            use proto::open_uncommitted_diff_response::Mode;
+
+            for load in loads {
+                let project_id = project_id.to_proto();
+                let buffer_id = load.buffer_id.to_proto();
+                match load.kind {
+                    DiffBaseLoadKind::Committed(result_tx) => {
+                        let result = async {
+                            let response = client
+                                .request(proto::OpenUncommittedDiff {
+                                    project_id,
+                                    buffer_id,
+                                })
+                                .await?;
+                            let mode =
+                                Mode::try_from(response.mode).ok().context("Invalid mode")?;
+                            Ok(match mode {
+                                Mode::IndexMatchesHead => {
+                                    DiffBasesChange::SetBoth(response.committed_text)
+                                }
+                                Mode::IndexAndHead => DiffBasesChange::SetEach {
+                                    head: response.committed_text,
+                                    index: response.staged_text,
+                                },
+                            })
+                        }
+                        .await;
+                        result_tx.send(result).ok();
+                    }
+                    DiffBaseLoadKind::Staged(result_tx) => {
+                        let result = client
+                            .request(proto::OpenUnstagedDiff {
+                                project_id,
+                                buffer_id,
+                            })
+                            .await
+                            .map(|response| response.staged_text);
+                        result_tx.send(result).ok();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn diff_bases_change_from_texts(
+    committed_text: Option<Vec<u8>>,
+    staged_text: Option<Vec<u8>>,
+) -> Result<DiffBasesChange> {
+    let committed_text = committed_text.map(decode_git_text).transpose()?;
+    let staged_text = staged_text.map(decode_git_text).transpose()?;
+    Ok(if committed_text == staged_text {
+        DiffBasesChange::SetBoth(committed_text)
+    } else {
+        DiffBasesChange::SetEach {
+            index: staged_text,
+            head: committed_text,
+        }
+    })
 }
 
 fn decode_git_text(bytes: Vec<u8>) -> Result<String> {
@@ -702,6 +828,7 @@ pub struct Repository {
     job_debug_queue: job_debug_queue::GitJobDebugQueue,
     pending_ops: SumTree<PendingOps>,
     job_id: JobId,
+    pending_diff_base_loads: Option<(JobId, Weak<RefCell<Vec<DiffBaseLoad>>>)>,
     askpass_delegates: RemoteAskPassDelegates,
     latest_askpass_id: u64,
     repository_state: Shared<Task<Result<RepositoryState, String>>>,
@@ -6594,6 +6721,7 @@ impl Repository {
             latest_askpass_id: 0,
             job_sender: mpsc::unbounded().0,
             job_id: 0,
+            pending_diff_base_loads: None,
             active_jobs: Default::default(),
             job_debug_queue: job_debug_queue::GitJobDebugQueue::new(),
             initial_graph_data: Default::default(),
@@ -6649,6 +6777,7 @@ impl Repository {
             active_jobs: Default::default(),
             job_debug_queue: job_debug_queue::GitJobDebugQueue::new(),
             job_id: 0,
+            pending_diff_base_loads: None,
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
@@ -10306,25 +10435,13 @@ impl Repository {
         repo_path: RepoPath,
         cx: &App,
     ) -> Task<Result<Option<String>>> {
-        let rx = self.send_job("load_staged_text", None, move |state, _| async move {
-            match state {
-                RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
-                    .load_index_text(repo_path)
-                    .await
-                    .map(decode_git_text)
-                    .transpose(),
-                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
-                    let response = client
-                        .request(proto::OpenUnstagedDiff {
-                            project_id: project_id.to_proto(),
-                            buffer_id: buffer_id.to_proto(),
-                        })
-                        .await?;
-                    Ok(response.staged_text)
-                }
-            }
+        let (result_tx, result_rx) = oneshot::channel();
+        self.queue_diff_base_load(DiffBaseLoad {
+            buffer_id,
+            repo_path,
+            kind: DiffBaseLoadKind::Staged(result_tx),
         });
-        cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
+        cx.spawn(|_: &mut AsyncApp| async move { result_rx.await? })
     }
 
     fn load_committed_text(
@@ -10333,57 +10450,40 @@ impl Repository {
         repo_path: RepoPath,
         cx: &App,
     ) -> Task<Result<DiffBasesChange>> {
-        let rx = self.send_job("load_committed_text", None, move |state, _| async move {
-            match state {
-                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    let revisions = vec![
-                        format!("HEAD:{}", repo_path.as_unix_str()),
-                        format!(":{}", repo_path.as_unix_str()),
-                    ];
-                    let mut loaded_revisions = backend.load_revisions(revisions).await?.into_iter();
-                    let committed_text = loaded_revisions
-                        .next()
-                        .flatten()
-                        .map(decode_git_text)
-                        .transpose()?;
-                    let staged_text = loaded_revisions
-                        .next()
-                        .flatten()
-                        .map(decode_git_text)
-                        .transpose()?;
-                    let diff_bases_change = if committed_text == staged_text {
-                        DiffBasesChange::SetBoth(committed_text)
-                    } else {
-                        DiffBasesChange::SetEach {
-                            index: staged_text,
-                            head: committed_text,
-                        }
-                    };
-                    anyhow::Ok(diff_bases_change)
-                }
-                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
-                    use proto::open_uncommitted_diff_response::Mode;
-
-                    let response = client
-                        .request(proto::OpenUncommittedDiff {
-                            project_id: project_id.to_proto(),
-                            buffer_id: buffer_id.to_proto(),
-                        })
-                        .await?;
-                    let mode = Mode::try_from(response.mode).ok().context("Invalid mode")?;
-                    let bases = match mode {
-                        Mode::IndexMatchesHead => DiffBasesChange::SetBoth(response.committed_text),
-                        Mode::IndexAndHead => DiffBasesChange::SetEach {
-                            head: response.committed_text,
-                            index: response.staged_text,
-                        },
-                    };
-                    Ok(bases)
-                }
-            }
+        let (result_tx, result_rx) = oneshot::channel();
+        self.queue_diff_base_load(DiffBaseLoad {
+            buffer_id,
+            repo_path,
+            kind: DiffBaseLoadKind::Committed(result_tx),
         });
+        cx.spawn(|_: &mut AsyncApp| async move { result_rx.await? })
+    }
 
-        cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
+    fn queue_diff_base_load(&mut self, load: DiffBaseLoad) {
+        // `git cat-file --batch` reads one revision per line, so this path would fail the whole batch.
+        if load.repo_path.as_unix_str().contains('\n') {
+            let error = anyhow!("path {:?} contains a newline", load.repo_path.as_unix_str());
+            load.kind.fail(error);
+            return;
+        }
+        // Joining only the most recently queued job keeps loads ordered with other git jobs.
+        if let Some((job_id, loads)) = &self.pending_diff_base_loads
+            && *job_id == self.job_id.wrapping_sub(1)
+            && let Some(loads) = loads.upgrade()
+        {
+            loads.borrow_mut().push(load);
+            return;
+        }
+        // The job owns the only `Rc`, so its loads are canceled if it's dropped without running,
+        // and no load can join once it starts.
+        let loads = Rc::new(RefCell::new(vec![load]));
+        self.pending_diff_base_loads = Some((self.job_id, Rc::downgrade(&loads)));
+        let _ = self.send_job("load_diff_bases", None, move |state, _| async move {
+            let loads = Rc::into_inner(loads)
+                .map(RefCell::into_inner)
+                .unwrap_or_default();
+            load_diff_bases(state, loads).await;
+        });
     }
 
     pub fn load_commit_template_text(
@@ -12065,6 +12165,86 @@ mod tests {
                 "regular file should have a git diff base"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_diff_base_loads_fail_when_their_job_is_dropped(cx: &mut TestAppContext) {
+        use util::path;
+
+        init_test(cx);
+        let project_root = Path::new(path!("/project"));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(project_root, json!({ ".git": {}, "a.txt": "a\n" }))
+            .await;
+        let project = Project::test(fs, [project_root], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let repository =
+            project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+
+        let (committed_loads, staged_loads) = repository.update(cx, |repository, cx| {
+            let buffer_id = BufferId::new(1).unwrap();
+            let queued_committed =
+                repository.load_committed_text(buffer_id, repo_path("a.txt"), cx);
+            let queued_staged = repository.load_staged_text(buffer_id, repo_path("a.txt"), cx);
+            // Drops the queued job without running it, and closes the job channel.
+            repository._worker_task = Task::ready(());
+            let unsent_committed =
+                repository.load_committed_text(buffer_id, repo_path("a.txt"), cx);
+            let unsent_staged = repository.load_staged_text(buffer_id, repo_path("a.txt"), cx);
+            (
+                [queued_committed, unsent_committed],
+                [queued_staged, unsent_staged],
+            )
+        });
+        cx.run_until_parked();
+        for load in committed_loads {
+            assert!(load.now_or_never().expect("load hung").is_err());
+        }
+        for load in staged_loads {
+            assert!(load.now_or_never().expect("load hung").is_err());
+        }
+    }
+
+    #[gpui::test]
+    async fn test_diff_base_load_with_newline_fails_alone(cx: &mut TestAppContext) {
+        use util::path;
+
+        init_test(cx);
+        let project_root = Path::new(path!("/project"));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(project_root, json!({ ".git": {}, "a.txt": "a\n" }))
+            .await;
+        fs.set_head_and_index_for_repo(&project_root.join(".git"), &[("a.txt", "a\n".into())]);
+        let project = Project::test(fs, [project_root], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let repository =
+            project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+
+        let ([committed_with_newline, committed], [staged_with_newline, staged]) = repository
+            .update(cx, |repository, cx| {
+                let buffer_id = BufferId::new(1).unwrap();
+                (
+                    [
+                        repository.load_committed_text(buffer_id, repo_path("a\nb.txt"), cx),
+                        repository.load_committed_text(buffer_id, repo_path("a.txt"), cx),
+                    ],
+                    [
+                        repository.load_staged_text(buffer_id, repo_path("a\nb.txt"), cx),
+                        repository.load_staged_text(buffer_id, repo_path("a.txt"), cx),
+                    ],
+                )
+            });
+        assert!(committed_with_newline.await.is_err());
+        assert!(matches!(
+            committed.await.unwrap(),
+            DiffBasesChange::SetBoth(Some(text)) if text == "a\n"
+        ));
+        assert_eq!(staged_with_newline.await.unwrap(), None);
+        assert_eq!(staged.await.unwrap().as_deref(), Some("a\n"));
     }
 
     #[gpui::test]
