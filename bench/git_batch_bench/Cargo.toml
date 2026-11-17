@@ -1,0 +1,50 @@
+[package]
+name = "git_batch_bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+client = { path = "../../crates/client" }
+clock = { path = "../../crates/clock" }
+fs = { path = "../../crates/fs" }
+futures = "0.3"
+gpui = { path = "../../crates/gpui" }
+gpui_platform = { path = "../../crates/gpui_platform" }
+http_client = { path = "../../crates/http_client" }
+language = { path = "../../crates/language" }
+libc = "0.2"
+node_runtime = { path = "../../crates/node_runtime" }
+project = { path = "../../crates/project" }
+release_channel = { path = "../../crates/release_channel" }
+semver = "1"
+settings = { path = "../../crates/settings" }
+util = { path = "../../crates/util" }
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = false
+codegen-units = 16
+incremental = false
+
+[patch.crates-io]
+cpal = { git = "https://github.com/RustAudio/cpal", rev = "e1612d5d98152f8dc2a62e1b51ef7cbf4f7f26b7" }
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "803c6ebaac27d69e1808b45058482e868d073ceb" }
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+async-task = { git = "https://github.com/smol-rs/async-task", rev = "41fd3359c75e221bd8b187a8ee361aa309c1714c" }
+windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+livekit = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "fbda05eb278b4a7c5be8fc9b2a92e9b62e732236" }
+libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "fbda05eb278b4a7c5be8fc9b2a92e9b62e732236" }
+notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "fbda05eb278b4a7c5be8fc9b2a92e9b62e732236" }
+khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }
+crash-context = { git = "https://github.com/rust-minidump/minidump-writer", rev = "911b04e09b79b736cc15cbe712e83e2d3f348bb9" }
+
+scratch = { path = "../../tooling/corgi/patches/scratch" }
+

@@ -235,12 +235,37 @@ enum DiffBaseLoadKind {
     Staged(oneshot::Sender<Result<Option<String>>>),
 }
 
-impl DiffBaseLoadKind {
+impl DiffBaseLoad {
+    fn revisions(&self) -> impl Iterator<Item = String> {
+        let path = self.repo_path.as_unix_str();
+        let committed_revision =
+            matches!(self.kind, DiffBaseLoadKind::Committed(_)).then(|| format!("HEAD:{path}"));
+        committed_revision.into_iter().chain([format!(":{path}")])
+    }
+
+    /// Takes this load's texts from `texts`, which yields them in the order of `revisions`.
+    fn finish(self, texts: &mut impl Iterator<Item = Option<Vec<u8>>>) {
+        match self.kind {
+            DiffBaseLoadKind::Committed(result_tx) => {
+                let committed_text = texts.next().flatten();
+                let staged_text = texts.next().flatten();
+                result_tx
+                    .send(diff_bases_change_from_texts(committed_text, staged_text))
+                    .ok();
+            }
+            DiffBaseLoadKind::Staged(result_tx) => {
+                let staged_text = texts.next().flatten();
+                result_tx
+                    .send(staged_text.map(decode_git_text).transpose())
+                    .ok();
+            }
+        }
+    }
+
     fn fail(self, error: anyhow::Error) {
-        match self {
-            Self::Committed(result_tx) => result_tx.send(Err(error)).ok(),
-            // Unstaged diffs treat an unreadable index entry as a missing one.
-            Self::Staged(result_tx) => result_tx.send(Ok(None)).ok(),
+        match self.kind {
+            DiffBaseLoadKind::Committed(result_tx) => result_tx.send(Err(error)).ok(),
+            DiffBaseLoadKind::Staged(result_tx) => result_tx.send(Err(error)).ok(),
         };
     }
 }
@@ -248,38 +273,30 @@ impl DiffBaseLoadKind {
 async fn load_diff_bases(state: RepositoryState, loads: Vec<DiffBaseLoad>) {
     match state {
         RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-            let mut revisions = Vec::new();
-            for load in &loads {
-                let path = load.repo_path.as_unix_str();
-                if let DiffBaseLoadKind::Committed(_) = load.kind {
-                    revisions.push(format!("HEAD:{path}"));
-                }
-                revisions.push(format!(":{path}"));
-            }
+            let revisions = loads.iter().flat_map(DiffBaseLoad::revisions).collect();
             match backend.load_revisions(revisions).await {
                 Ok(texts) => {
                     let mut texts = texts.into_iter();
                     for load in loads {
-                        match load.kind {
-                            DiffBaseLoadKind::Committed(result_tx) => {
-                                let committed_text = texts.next().flatten();
-                                let staged_text = texts.next().flatten();
-                                result_tx
-                                    .send(diff_bases_change_from_texts(committed_text, staged_text))
-                                    .ok();
-                            }
-                            DiffBaseLoadKind::Staged(result_tx) => {
-                                let staged_text = texts.next().flatten();
-                                result_tx
-                                    .send(staged_text.map(decode_git_text).transpose())
-                                    .ok();
-                            }
+                        load.finish(&mut texts);
+                    }
+                }
+                // One unreadable revision fails the whole batch, so each load retries alone.
+                Err(error) if loads.len() > 1 => {
+                    log::warn!(
+                        "retrying {} diff base loads separately: {error:#}",
+                        loads.len()
+                    );
+                    for load in loads {
+                        match backend.load_revisions(load.revisions().collect()).await {
+                            Ok(texts) => load.finish(&mut texts.into_iter()),
+                            Err(error) => load.fail(error),
                         }
                     }
                 }
                 Err(error) => {
                     for load in loads {
-                        load.kind.fail(anyhow!("{error:#}"));
+                        load.fail(anyhow!("{error:#}"));
                     }
                 }
             }
@@ -10429,12 +10446,101 @@ impl Repository {
         (job_tx, worker_task)
     }
 
+    fn load_staged_text_unbatched(
+        &mut self,
+        buffer_id: BufferId,
+        repo_path: RepoPath,
+        cx: &App,
+    ) -> Task<Result<Option<String>>> {
+        let rx = self.send_job("load_staged_text", None, move |state, _| async move {
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
+                    .load_index_text(repo_path)
+                    .await
+                    .map(decode_git_text)
+                    .transpose(),
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response = client
+                        .request(proto::OpenUnstagedDiff {
+                            project_id: project_id.to_proto(),
+                            buffer_id: buffer_id.to_proto(),
+                        })
+                        .await?;
+                    Ok(response.staged_text)
+                }
+            }
+        });
+        cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
+    }
+
+    fn load_committed_text_unbatched(
+        &mut self,
+        buffer_id: BufferId,
+        repo_path: RepoPath,
+        cx: &App,
+    ) -> Task<Result<DiffBasesChange>> {
+        let rx = self.send_job("load_committed_text", None, move |state, _| async move {
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    let revisions = vec![
+                        format!("HEAD:{}", repo_path.as_unix_str()),
+                        format!(":{}", repo_path.as_unix_str()),
+                    ];
+                    let mut loaded_revisions = backend.load_revisions(revisions).await?.into_iter();
+                    let committed_text = loaded_revisions
+                        .next()
+                        .flatten()
+                        .map(decode_git_text)
+                        .transpose()?;
+                    let staged_text = loaded_revisions
+                        .next()
+                        .flatten()
+                        .map(decode_git_text)
+                        .transpose()?;
+                    let diff_bases_change = if committed_text == staged_text {
+                        DiffBasesChange::SetBoth(committed_text)
+                    } else {
+                        DiffBasesChange::SetEach {
+                            index: staged_text,
+                            head: committed_text,
+                        }
+                    };
+                    anyhow::Ok(diff_bases_change)
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    use proto::open_uncommitted_diff_response::Mode;
+
+                    let response = client
+                        .request(proto::OpenUncommittedDiff {
+                            project_id: project_id.to_proto(),
+                            buffer_id: buffer_id.to_proto(),
+                        })
+                        .await?;
+                    let mode = Mode::try_from(response.mode).ok().context("Invalid mode")?;
+                    let bases = match mode {
+                        Mode::IndexMatchesHead => DiffBasesChange::SetBoth(response.committed_text),
+                        Mode::IndexAndHead => DiffBasesChange::SetEach {
+                            head: response.committed_text,
+                            index: response.staged_text,
+                        },
+                    };
+                    Ok(bases)
+                }
+            }
+        });
+
+        cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
+    }
+
     fn load_staged_text(
         &mut self,
         buffer_id: BufferId,
         repo_path: RepoPath,
         cx: &App,
     ) -> Task<Result<Option<String>>> {
+        if std::env::var_os("ZED_NO_DIFF_BASE_BATCH").is_some() {
+            return self.load_staged_text_unbatched(buffer_id, repo_path, cx);
+        }
         let (result_tx, result_rx) = oneshot::channel();
         self.queue_diff_base_load(DiffBaseLoad {
             buffer_id,
@@ -10450,6 +10556,9 @@ impl Repository {
         repo_path: RepoPath,
         cx: &App,
     ) -> Task<Result<DiffBasesChange>> {
+        if std::env::var_os("ZED_NO_DIFF_BASE_BATCH").is_some() {
+            return self.load_committed_text_unbatched(buffer_id, repo_path, cx);
+        }
         let (result_tx, result_rx) = oneshot::channel();
         self.queue_diff_base_load(DiffBaseLoad {
             buffer_id,
@@ -10463,7 +10572,7 @@ impl Repository {
         // `git cat-file --batch` reads one revision per line, so this path would fail the whole batch.
         if load.repo_path.as_unix_str().contains('\n') {
             let error = anyhow!("path {:?} contains a newline", load.repo_path.as_unix_str());
-            load.kind.fail(error);
+            load.fail(error);
             return;
         }
         // Joining only the most recently queued job keeps loads ordered with other git jobs.
@@ -12243,8 +12352,63 @@ mod tests {
             committed.await.unwrap(),
             DiffBasesChange::SetBoth(Some(text)) if text == "a\n"
         ));
-        assert_eq!(staged_with_newline.await.unwrap(), None);
+        assert!(staged_with_newline.await.is_err());
         assert_eq!(staged.await.unwrap().as_deref(), Some("a\n"));
+    }
+
+    #[gpui::test]
+    async fn test_diff_base_load_with_unreadable_revision_fails_alone(cx: &mut TestAppContext) {
+        use util::path;
+
+        init_test(cx);
+        let project_root = Path::new(path!("/project"));
+        let dot_git = project_root.join(".git");
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            project_root,
+            json!({ ".git": {}, "a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n" }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            &dot_git,
+            &[
+                ("a.txt", "a\n".into()),
+                ("b.txt", "b\n".into()),
+                ("c.txt", "c\n".into()),
+            ],
+        );
+        fs.with_git_state(&dot_git, false, |state| {
+            state
+                .simulated_unreadable_revisions
+                .insert("HEAD:b.txt".into());
+        })
+        .unwrap();
+        let project = Project::test(fs, [project_root], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let repository =
+            project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+
+        let ([committed_a, committed_b, committed_c], staged_b) =
+            repository.update(cx, |repository, cx| {
+                let buffer_id = BufferId::new(1).unwrap();
+                (
+                    ["a.txt", "b.txt", "c.txt"]
+                        .map(|path| repository.load_committed_text(buffer_id, repo_path(path), cx)),
+                    repository.load_staged_text(buffer_id, repo_path("b.txt"), cx),
+                )
+            });
+        assert!(matches!(
+            committed_a.await.unwrap(),
+            DiffBasesChange::SetBoth(Some(text)) if text == "a\n"
+        ));
+        assert!(committed_b.await.is_err());
+        assert!(matches!(
+            committed_c.await.unwrap(),
+            DiffBasesChange::SetBoth(Some(text)) if text == "c\n"
+        ));
+        assert_eq!(staged_b.await.unwrap().as_deref(), Some("b\n"));
     }
 
     #[gpui::test]

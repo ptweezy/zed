@@ -1,0 +1,45 @@
+name: Measure batched committed-text loads
+on:
+  push:
+    branches:
+      - bench-git-batch
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: ./script/linux
+      - name: Clone test repositories
+        shell: bash
+        run: |
+          git config --global core.longpaths true
+          git clone --quiet --depth 1 https://github.com/rust-lang/rust "$RUNNER_TEMP/rust"
+          if [ "$RUNNER_OS" != Windows ]; then
+            git clone --quiet --depth 1 https://github.com/torvalds/linux "$RUNNER_TEMP/linux"
+          fi
+          for repository in "$RUNNER_TEMP"/rust "$RUNNER_TEMP"/linux; do
+            [ -d "$repository" ] && echo "$repository: $(git -C "$repository" ls-files | wc -l) files, index $(wc -c < "$repository/.git/index") bytes"
+          done
+          git --version
+      - name: Build harness
+        shell: bash
+        run: |
+          cp Cargo.lock bench/git_batch_bench/Cargo.lock
+          cargo build --release --manifest-path bench/git_batch_bench/Cargo.toml
+      - name: Measure
+        shell: bash
+        run: |
+          repositories=("$RUNNER_TEMP/rust")
+          [ -d "$RUNNER_TEMP/linux" ] && repositories+=("$RUNNER_TEMP/linux")
+          bench/git_batch_bench/run.sh bench/git_batch_bench/target/release/git_batch_bench 5 1000 -- "${repositories[@]}" | tee results.txt
+          { echo '```'; cat results.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

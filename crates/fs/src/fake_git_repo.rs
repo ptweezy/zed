@@ -76,6 +76,8 @@ pub struct FakeGitRepositoryState {
     pub simulated_index_write_error_message: Option<String>,
     pub simulated_create_worktree_error: Option<String>,
     pub simulated_graph_error: Option<String>,
+    /// Revisions that fail any `load_revisions` call that includes them.
+    pub simulated_unreadable_revisions: HashSet<String>,
     pub branches_requiring_force_delete: HashSet<String>,
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
     pub refs: HashMap<String, String>,
@@ -104,6 +106,7 @@ impl FakeGitRepositoryState {
             simulated_index_write_error_message: Default::default(),
             simulated_create_worktree_error: Default::default(),
             simulated_graph_error: None,
+            simulated_unreadable_revisions: HashSet::default(),
             branches_requiring_force_delete: Default::default(),
             worktrees_requiring_force_delete: Default::default(),
             refs: HashMap::from_iter([("HEAD".into(), "abc".into())]),
@@ -385,6 +388,12 @@ impl GitRepository for FakeGitRepository {
         revisions: Vec<String>,
     ) -> BoxFuture<'_, Result<Vec<Option<Vec<u8>>>>> {
         let fut = self.with_state_async(false, move |state| {
+            if let Some(revision) = revisions
+                .iter()
+                .find(|revision| state.simulated_unreadable_revisions.contains(*revision))
+            {
+                bail!("simulated failure to read {revision}");
+            }
             Ok(revisions
                 .into_iter()
                 .map(|rev| {
