@@ -7,12 +7,21 @@ from collections import defaultdict
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-binaries_dir, repositories_dir, summary_path = sys.argv[1:4]
+binaries_dir, repositories_dir, summary_path, *variants = sys.argv[1:]
+baseline = variants[0]
 rounds = int(os.environ.get("BENCH_ROUNDS", "3"))
 suffix = ".exe" if os.name == "nt" else ""
 names = [
     name
-    for name in ["linux-stale", "zed", "linux", "firefox", "linux-stale-detached"]
+    for name in [
+        "linux-stale",
+        "zed",
+        "zed-behind",
+        "linux",
+        "linux-behind",
+        "firefox",
+        "linux-stale-detached",
+    ]
     if os.path.isdir(os.path.join(repositories_dir, name))
 ]
 environment = dict(
@@ -26,8 +35,8 @@ heads = defaultdict(set)
 branch_counts = {}
 with open("results.tsv", "w") as results:
     for round_number in range(1, rounds + 1):
-        variants = ("before", "after") if round_number % 2 else ("after", "before")
-        for variant in variants:
+        shift = (round_number - 1) % len(variants)
+        for variant in variants[shift:] + variants[:shift]:
             completed = subprocess.run(
                 [os.path.join(binaries_dir, variant + suffix)],
                 env=environment,
@@ -58,25 +67,32 @@ def format_duration(nanoseconds):
 
 
 git_version = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout.strip()
+others = variants[1:]
 lines = [
     f"### {platform.system()} {platform.release()} ({platform.machine()}), {os.cpu_count()} CPUs, {git_version}",
     "",
-    f"Median `branches()` time, release build, {rounds} alternating rounds of five calls.",
+    f"Median `branches()` time, release build, {rounds} rotating rounds of five calls.",
     "",
-    "| Repository | Branches | Before | After | Speedup | Same head tracking |",
-    "|---|---|---|---|---|---|",
+    "| Repository | Branches | "
+    + " | ".join(variants)
+    + " | "
+    + " | ".join(f"{variant} speedup" for variant in others)
+    + " | Same head tracking |",
+    "|---|---|" + "---|" * (len(variants) + len(others)) + "---|",
 ]
 for name in names:
-    before = statistics.median(samples[(name, "before")])
-    after = statistics.median(samples[(name, "after")])
-    same = heads[(name, "before")] == heads[(name, "after")]
+    medians = {variant: statistics.median(samples[(name, variant)]) for variant in variants}
+    same = all(heads[(name, variant)] == heads[(name, baseline)] for variant in variants)
     lines.append(
-        f"| {name} | {branch_counts[name]:,} | {format_duration(before)} | {format_duration(after)} "
-        f"| {before / after:,.2f}× | {'yes' if same else 'NO'} |"
+        f"| {name} | {branch_counts[name]:,} | "
+        + " | ".join(format_duration(medians[variant]) for variant in variants)
+        + " | "
+        + " | ".join(f"{medians[baseline] / medians[variant]:,.2f}×" for variant in others)
+        + f" | {'yes' if same else 'NO'} |"
     )
 lines += ["", "| Repository | Variant | Per-round medians | Samples | Head tracking |", "|---|---|---|---|---|"]
 for name in names:
-    for variant in ("before", "after"):
+    for variant in variants:
         per_round = ", ".join(
             format_duration(statistics.median(round_samples[(name, variant, round_number)]))
             for round_number in range(1, rounds + 1)

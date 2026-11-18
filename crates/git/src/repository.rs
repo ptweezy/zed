@@ -2187,14 +2187,6 @@ impl GitRepository for RealGitRepository {
                     "--format",
                     &fields,
                 ];
-                // `%(upstream:track)` walks the history between every branch and its upstream,
-                // so a parallel read gets it only for the branches at `HEAD`. The read is dropped,
-                // which kills it, unless the listed head has an upstream.
-                let head_upstreams = git.executor.spawn({
-                    let mut command = git.build_command(&HEAD_UPSTREAMS_ARGS);
-                    command.kill_on_drop(true);
-                    async move { command.output().await }
-                });
                 let output = git.build_command(&args).output().await?;
 
                 let error = if output.status.success() {
@@ -2207,18 +2199,14 @@ impl GitRepository for RealGitRepository {
 
                 let input = String::from_utf8_lossy(&output.stdout);
                 let mut branches = parse_branch_input(&input)?;
-                if let Some(head) = branches
-                    .iter_mut()
-                    .find(|branch| branch.is_head && branch.upstream.is_some())
-                {
-                    let head_upstreams = head_upstreams
-                        .await
-                        .log_err()
-                        .map(|output| output.stdout)
-                        .unwrap_or_default();
-                    update_upstream_tracking(&git, head, &String::from_utf8_lossy(&head_upstreams))
-                        .await
-                        .log_err();
+                // `%(upstream:track)` walks the history between every branch and its upstream,
+                // so only the checked-out branch gets it, and only if the listing doesn't show
+                // its upstream at the same commit.
+                let head = branches
+                    .iter()
+                    .position(|branch| branch.is_head && needs_upstream_count(branch, &branches));
+                if let Some(head) = head.and_then(|head| branches.get_mut(head)) {
+                    update_upstream_tracking(&git, head).await.log_err();
                 }
                 if branches.is_empty() {
                     let args = vec!["symbolic-ref", "--quiet", "HEAD"];
@@ -4194,31 +4182,32 @@ fn format_branch_scan_error(output: &Output) -> String {
     }
 }
 
-const UPSTREAM_FORMAT: &str = "--format=%(refname)%00%(upstream)%00%(upstream:track)";
-const HEAD_UPSTREAMS_ARGS: [&str; 4] = [
-    "for-each-ref",
-    "--points-at=HEAD",
-    UPSTREAM_FORMAT,
-    "refs/heads/",
-];
-
-async fn update_upstream_tracking(
-    git: &GitBinary,
-    branch: &mut Branch,
-    head_upstreams: &str,
-) -> Result<()> {
-    // `head_upstreams` resolved `HEAD` separately from the listing, so it lacks the listed branch
-    // if a checkout moved `HEAD` to another commit in between.
-    let output;
-    let (upstream_name, upstream_track) = match find_upstream(head_upstreams, &branch.ref_name) {
-        Some(upstream) => upstream,
-        None => {
-            output = git
-                .run(&["for-each-ref", UPSTREAM_FORMAT, &branch.ref_name])
-                .await?;
-            find_upstream(&output, &branch.ref_name).context("branch no longer exists")?
-        }
+/// A branch without an upstream has no counts, and one at its listed upstream's commit has zero.
+fn needs_upstream_count(branch: &Branch, branches: &[Branch]) -> bool {
+    let (Some(upstream), Some(commit)) = (&branch.upstream, &branch.most_recent_commit) else {
+        return false;
     };
+    !branches.iter().any(|listed| {
+        listed.ref_name == upstream.ref_name
+            && listed
+                .most_recent_commit
+                .as_ref()
+                .is_some_and(|listed_commit| listed_commit.sha == commit.sha)
+    })
+}
+
+async fn update_upstream_tracking(git: &GitBinary, branch: &mut Branch) -> Result<()> {
+    // `HEAD` and the upstream may have changed since the listing, so name the listed branch and
+    // read its upstream with the counts.
+    let output = git
+        .run(&[
+            "for-each-ref",
+            "--format=%(upstream)%00%(upstream:track)",
+            &branch.ref_name,
+        ])
+        .await?;
+    let (upstream_name, upstream_track) =
+        output.split_once('\0').context("branch no longer exists")?;
     branch.upstream = if upstream_name.is_empty() {
         None
     } else {
@@ -4228,14 +4217,6 @@ async fn update_upstream_tracking(
         })
     };
     Ok(())
-}
-
-fn find_upstream<'a>(output: &'a str, ref_name: &str) -> Option<(&'a str, &'a str)> {
-    output.lines().find_map(|line| {
-        line.strip_prefix(ref_name)?
-            .strip_prefix('\0')?
-            .split_once('\0')
-    })
 }
 
 fn parse_upstream_track(upstream_track: &str) -> Result<UpstreamTracking> {
@@ -6095,6 +6076,8 @@ mod tests {
         git_command(path, ["branch", "deleted"]);
         git_command(path, ["commit", "--allow-empty", "-m", "second"]);
         git_command(path, ["branch", "--set-upstream-to=main", "behind_main"]);
+        git_command(path, ["branch", "at_main"]);
+        git_command(path, ["branch", "--set-upstream-to=main", "at_main"]);
         git_command(path, ["branch", "--set-upstream-to=deleted", "main"]);
         git_command(path, ["branch", "-D", "deleted"]);
         git_command(path, ["update-ref", "refs/custom/main", "main"]);
@@ -6119,8 +6102,9 @@ mod tests {
             ahead: 1,
             behind: 1,
         });
-        // `behind_main`, `custom` and `tagged` share a commit, so each gets all three lines.
+        let up_to_date = UpstreamTracking::Tracked(UpstreamTrackingStatus::default());
         for (branch_name, upstream_name, expected_tracking) in [
+            ("at_main", "refs/heads/main", up_to_date),
             ("behind_main", "refs/heads/main", behind_by_one),
             ("diverged", "refs/heads/main", ahead_and_behind_by_one),
             ("main", "refs/heads/deleted", UpstreamTracking::Gone),
@@ -6141,7 +6125,7 @@ mod tests {
             );
         }
 
-        // `HEAD` and the upstream can change between the listing and the parallel read.
+        // `HEAD` and the upstream can change between the listing and the count.
         git_command(path, ["checkout", "behind_main"]);
         let mut branches = repo.branches().await.unwrap().branches;
         let head = branches.iter_mut().find(|branch| branch.is_head).unwrap();
@@ -6150,8 +6134,7 @@ mod tests {
             path,
             ["branch", "--set-upstream-to=diverged", "behind_main"],
         );
-        let head_upstreams = git_command_output(path, HEAD_UPSTREAMS_ARGS);
-        update_upstream_tracking(&repo.git_binary(), head, &head_upstreams)
+        update_upstream_tracking(&repo.git_binary(), head)
             .await
             .unwrap();
         assert_eq!(

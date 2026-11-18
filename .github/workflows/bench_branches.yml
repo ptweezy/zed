@@ -16,6 +16,7 @@ jobs:
     timeout-minutes: 180
     env:
       MAIN_COMMIT: 96362135eb98a011ac17b56a5c90cf77f9f597f1
+      CURRENT_COMMIT: 5c08d7d9211460b3896c10620ab8f66f19e8204f
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux dependencies
@@ -40,12 +41,19 @@ jobs:
           done
           oldest=$(git -C linux-stale-detached for-each-ref --sort=committerdate --count=1 --format='%(objectname)' refs/heads/old/)
           git -C linux-stale-detached update-ref --no-deref HEAD "$oldest"
-          git --version
-          for name in linux-stale zed linux firefox linux-stale-detached; do
-            listed=$(git -C "$name" for-each-ref --format=x 'refs/heads/**/*' 'refs/remotes/**/*' | wc -l)
-            echo "$name: $listed listed refs, HEAD $(git -C "$name" symbolic-ref --quiet --short HEAD || git -C "$name" rev-parse --short HEAD)"
+          cp -R zed zed-behind
+          git clone --quiet --shared --no-checkout linux linux-behind
+          for name in zed-behind linux-behind; do
+            branch=$(git -C "$name" symbolic-ref --short HEAD)
+            git -C "$name" update-ref "refs/heads/$branch" "refs/heads/$branch~3"
           done
-      - name: Build both variants
+          git --version
+          for name in linux-stale zed zed-behind linux linux-behind firefox linux-stale-detached; do
+            listed=$(git -C "$name" for-each-ref --format=x 'refs/heads/**/*' 'refs/remotes/**/*' | wc -l)
+            head=$(git -C "$name" symbolic-ref --quiet --short HEAD || git -C "$name" rev-parse --short HEAD)
+            echo "$name: $listed listed refs, HEAD $head $(git -C "$name" for-each-ref --format='%(upstream:track)' "refs/heads/$head" 2>/dev/null)"
+          done
+      - name: Build three variants
         shell: bash
         run: |
           set -euo pipefail
@@ -58,13 +66,17 @@ jobs:
             cargo build --release -p git --example bench_branches
             cp "target/release/examples/bench_branches$suffix" "$binaries/$1$suffix"
           }
-          build after
-          git fetch --quiet --no-tags --depth 1 origin "$MAIN_COMMIT"
+          build variant
+          git fetch --quiet --no-tags --depth 1 origin "$MAIN_COMMIT" "$CURRENT_COMMIT"
+          git show "$CURRENT_COMMIT:$source" > "$source"
+          build current
           git show "$MAIN_COMMIT:$source" > "$source"
           build before
-          grep -q -a -- '--points-at=HEAD' "$binaries/after$suffix"
-          if grep -q -a -- '--points-at=HEAD' "$binaries/before$suffix"; then
-            echo "the before binary contains the new code" >&2
+          contains() { grep -q -a -- "$2" "$binaries/$1$suffix"; }
+          contains current '--points-at=HEAD'
+          contains variant '--format=%(upstream)%00%(upstream:track)'
+          if contains variant '--points-at=HEAD' || contains before '--points-at=HEAD' || contains before '--format=%(upstream)%00%(upstream:track)'; then
+            echo "a binary contains another variant's code" >&2
             exit 1
           fi
           ls -l "$binaries"
@@ -73,7 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           python=$(command -v python3 || command -v python)
-          "$python" bench/branches_bench/measure.py "$RUNNER_TEMP/binaries" "$RUNNER_TEMP/repositories" "$GITHUB_STEP_SUMMARY"
+          "$python" bench/branches_bench/measure.py "$RUNNER_TEMP/binaries" "$RUNNER_TEMP/repositories" "$GITHUB_STEP_SUMMARY" before current variant
       - uses: actions/upload-artifact@v4
         if: always()
         with:
