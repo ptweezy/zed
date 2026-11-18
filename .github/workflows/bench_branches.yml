@@ -1,0 +1,85 @@
+name: Measure branch listing
+on:
+  push:
+    branches:
+      - bench-branches-head-tracking
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      MAIN_COMMIT: 96362135eb98a011ac17b56a5c90cf77f9f597f1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: ./script/linux
+      - name: Clone test repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.longpaths true
+          mkdir -p "$RUNNER_TEMP/repositories"
+          cd "$RUNNER_TEMP/repositories"
+          for url in https://github.com/torvalds/linux https://github.com/zed-industries/zed https://github.com/mozilla-firefox/firefox; do
+            git clone --quiet --filter=tree:0 --no-checkout "$url"
+          done
+          for name in linux-stale linux-stale-detached; do
+            git clone --quiet --shared --no-checkout linux "$name"
+            for tag in $(git -C "$name" tag --sort=creatordate | grep -E '^v[0-9]+\.[0-9]+$' | tail -50); do
+              git -C "$name" branch --quiet --no-track "old/$tag" "$tag^{commit}"
+              git -C "$name" branch --quiet --set-upstream-to=origin/master "old/$tag"
+            done
+          done
+          oldest=$(git -C linux-stale-detached for-each-ref --sort=committerdate --count=1 --format='%(objectname)' refs/heads/old/)
+          git -C linux-stale-detached update-ref --no-deref HEAD "$oldest"
+          git --version
+          for name in linux-stale zed linux firefox linux-stale-detached; do
+            listed=$(git -C "$name" for-each-ref --format=x 'refs/heads/**/*' 'refs/remotes/**/*' | wc -l)
+            echo "$name: $listed listed refs, HEAD $(git -C "$name" symbolic-ref --quiet --short HEAD || git -C "$name" rev-parse --short HEAD)"
+          done
+      - name: Build both variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          binaries="$RUNNER_TEMP/binaries"
+          mkdir -p "$binaries"
+          source=crates/git/src/repository.rs
+          build() {
+            "$python" bench/branches_bench/insert_harness.py "$source" bench/branches_bench/bench_test.rs
+            cargo clean --release -p git
+            executable=$(cargo test --release -p git --lib --no-run --message-format=json | "$python" bench/branches_bench/test_executable.py)
+            cp "$executable" "$binaries/$1$suffix"
+          }
+          build after
+          git fetch --quiet --no-tags --depth 1 origin "$MAIN_COMMIT"
+          git show "$MAIN_COMMIT:$source" > "$source"
+          build before
+          grep -q -a -- '--points-at=HEAD' "$binaries/after$suffix"
+          if grep -q -a -- '--points-at=HEAD' "$binaries/before$suffix"; then
+            echo "the before binary contains the new code" >&2
+            exit 1
+          fi
+          ls -l "$binaries"
+      - name: Measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          "$python" bench/branches_bench/measure.py "$RUNNER_TEMP/binaries" "$RUNNER_TEMP/repositories" "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.os }}
+          path: results.tsv
+          if-no-files-found: ignore
