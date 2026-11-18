@@ -2187,15 +2187,15 @@ impl GitRepository for RealGitRepository {
                     "--format",
                     &fields,
                 ];
-                // `%(upstream:track)` walks the history of every branch.
-                let head_tracking_args =
-                    ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"];
-                let (output, head_tracking) = futures::future::join(
-                    git.build_command(&args).output(),
-                    git.build_command(&head_tracking_args).output(),
-                )
-                .await;
-                let output = output?;
+                // `%(upstream:track)` walks the history between every branch and its upstream,
+                // so a parallel read gets it only for the branches at `HEAD`. The read is dropped,
+                // which kills it, unless the listed head has an upstream.
+                let head_upstreams = git.executor.spawn({
+                    let mut command = git.build_command(&HEAD_UPSTREAMS_ARGS);
+                    command.kill_on_drop(true);
+                    async move { command.output().await }
+                });
+                let output = git.build_command(&args).output().await?;
 
                 let error = if output.status.success() {
                     None
@@ -2207,13 +2207,18 @@ impl GitRepository for RealGitRepository {
 
                 let input = String::from_utf8_lossy(&output.stdout);
                 let mut branches = parse_branch_input(&input)?;
-                if let Some(upstream) = branches
+                if let Some(head) = branches
                     .iter_mut()
-                    .find(|branch| branch.is_head)
-                    .and_then(|head| head.upstream.as_mut())
-                    && let Some(tracking) = parse_head_tracking(head_tracking).log_err()
+                    .find(|branch| branch.is_head && branch.upstream.is_some())
                 {
-                    upstream.tracking = tracking;
+                    let head_upstreams = head_upstreams
+                        .await
+                        .log_err()
+                        .map(|output| output.stdout)
+                        .unwrap_or_default();
+                    update_upstream_tracking(&git, head, &String::from_utf8_lossy(&head_upstreams))
+                        .await
+                        .log_err();
                 }
                 if branches.is_empty() {
                     let args = vec!["symbolic-ref", "--quiet", "HEAD"];
@@ -4189,17 +4194,76 @@ fn format_branch_scan_error(output: &Output) -> String {
     }
 }
 
-fn parse_head_tracking(output: std::io::Result<Output>) -> Result<UpstreamTracking> {
-    let output = output?;
-    // `rev-list` fails exactly when `%(upstream:track)` reports the upstream as gone.
-    if !output.status.success() {
-        return Ok(UpstreamTracking::Gone);
+const UPSTREAM_FORMAT: &str = "--format=%(refname)%00%(upstream)%00%(upstream:track)";
+const HEAD_UPSTREAMS_ARGS: [&str; 4] = [
+    "for-each-ref",
+    "--points-at=HEAD",
+    UPSTREAM_FORMAT,
+    "refs/heads/",
+];
+
+async fn update_upstream_tracking(
+    git: &GitBinary,
+    branch: &mut Branch,
+    head_upstreams: &str,
+) -> Result<()> {
+    // `head_upstreams` resolved `HEAD` separately from the listing, so it lacks the listed branch
+    // if a checkout moved `HEAD` to another commit in between.
+    let output;
+    let (upstream_name, upstream_track) = match find_upstream(head_upstreams, &branch.ref_name) {
+        Some(upstream) => upstream,
+        None => {
+            output = git
+                .run(&["for-each-ref", UPSTREAM_FORMAT, &branch.ref_name])
+                .await?;
+            find_upstream(&output, &branch.ref_name).context("branch no longer exists")?
+        }
+    };
+    branch.upstream = if upstream_name.is_empty() {
+        None
+    } else {
+        Some(Upstream {
+            ref_name: upstream_name.into(),
+            tracking: parse_upstream_track(upstream_track)?,
+        })
+    };
+    Ok(())
+}
+
+fn find_upstream<'a>(output: &'a str, ref_name: &str) -> Option<(&'a str, &'a str)> {
+    output.lines().find_map(|line| {
+        line.strip_prefix(ref_name)?
+            .strip_prefix('\0')?
+            .split_once('\0')
+    })
+}
+
+fn parse_upstream_track(upstream_track: &str) -> Result<UpstreamTracking> {
+    if upstream_track.is_empty() {
+        return Ok(UpstreamTracking::Tracked(UpstreamTrackingStatus {
+            ahead: 0,
+            behind: 0,
+        }));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let (ahead, behind) = stdout.trim().split_once('\t').context("no tab in output")?;
+
+    let upstream_track = upstream_track.strip_prefix("[").context("missing [")?;
+    let upstream_track = upstream_track.strip_suffix("]").context("missing [")?;
+    let mut ahead: u32 = 0;
+    let mut behind: u32 = 0;
+    for component in upstream_track.split(", ") {
+        if component == "gone" {
+            return Ok(UpstreamTracking::Gone);
+        }
+        if let Some(ahead_num) = component.strip_prefix("ahead ") {
+            ahead = ahead_num.parse::<u32>()?;
+        }
+        if let Some(behind_num) = component.strip_prefix("behind ") {
+            behind = behind_num.parse::<u32>()?;
+        }
+    }
     Ok(UpstreamTracking::Tracked(UpstreamTrackingStatus {
-        ahead: ahead.parse()?,
-        behind: behind.parse()?,
+        ahead,
+        behind,
     }))
 }
 
@@ -6040,6 +6104,9 @@ mod tests {
         git_command(path, ["remote", "add", "origin", "."]);
         git_command(path, ["update-ref", "refs/remotes/origin/v1", "v1"]);
         git_command(path, ["branch", "--set-upstream-to=origin/v1", "tagged"]);
+        git_command(path, ["checkout", "-b", "diverged", "behind_main"]);
+        git_command(path, ["commit", "--allow-empty", "-m", "third"]);
+        git_command(path, ["branch", "--set-upstream-to=main", "diverged"]);
 
         let repo =
             RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
@@ -6048,22 +6115,52 @@ mod tests {
             ahead: 0,
             behind: 1,
         });
-        for (branch_name, expected_tracking) in [
-            ("behind_main", behind_by_one),
-            ("main", UpstreamTracking::Gone),
-            ("custom", behind_by_one),
-            ("tagged", behind_by_one),
+        let ahead_and_behind_by_one = UpstreamTracking::Tracked(UpstreamTrackingStatus {
+            ahead: 1,
+            behind: 1,
+        });
+        // `behind_main`, `custom` and `tagged` share a commit, so each gets all three lines.
+        for (branch_name, upstream_name, expected_tracking) in [
+            ("behind_main", "refs/heads/main", behind_by_one),
+            ("diverged", "refs/heads/main", ahead_and_behind_by_one),
+            ("main", "refs/heads/deleted", UpstreamTracking::Gone),
+            ("custom", "refs/custom/main", behind_by_one),
+            ("tagged", "refs/remotes/origin/v1", behind_by_one),
         ] {
             git_command(path, ["checkout", branch_name]);
             let branches = repo.branches().await.unwrap().branches;
             let head = branches.iter().find(|branch| branch.is_head).unwrap();
             assert_eq!(head.name(), branch_name);
             assert_eq!(
-                head.upstream.as_ref().map(|upstream| upstream.tracking),
-                Some(expected_tracking),
+                head.upstream,
+                Some(Upstream {
+                    ref_name: upstream_name.into(),
+                    tracking: expected_tracking,
+                }),
                 "{branch_name}"
             );
         }
+
+        // `HEAD` and the upstream can change between the listing and the parallel read.
+        git_command(path, ["checkout", "behind_main"]);
+        let mut branches = repo.branches().await.unwrap().branches;
+        let head = branches.iter_mut().find(|branch| branch.is_head).unwrap();
+        git_command(path, ["checkout", "main"]);
+        git_command(
+            path,
+            ["branch", "--set-upstream-to=diverged", "behind_main"],
+        );
+        let head_upstreams = git_command_output(path, HEAD_UPSTREAMS_ARGS);
+        update_upstream_tracking(&repo.git_binary(), head, &head_upstreams)
+            .await
+            .unwrap();
+        assert_eq!(
+            head.upstream,
+            Some(Upstream {
+                ref_name: "refs/heads/diverged".into(),
+                tracking: behind_by_one,
+            })
+        );
     }
 
     #[test]
