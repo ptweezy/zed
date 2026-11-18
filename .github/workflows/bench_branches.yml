@@ -49,17 +49,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python=$(command -v python3 || command -v python)
           suffix=""
           if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
           binaries="$RUNNER_TEMP/binaries"
           mkdir -p "$binaries"
           source=crates/git/src/repository.rs
           build() {
-            "$python" bench/branches_bench/insert_harness.py "$source" bench/branches_bench/bench_test.rs
-            cargo clean --release -p git
-            executable=$(cargo test --release -p git --lib --no-run --message-format=json | "$python" bench/branches_bench/test_executable.py)
-            cp "$executable" "$binaries/$1$suffix"
+            cargo build --release -p git --example bench_branches
+            cp "target/release/examples/bench_branches$suffix" "$binaries/$1$suffix"
           }
           build after
           git fetch --quiet --no-tags --depth 1 origin "$MAIN_COMMIT"

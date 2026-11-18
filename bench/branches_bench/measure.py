@@ -29,13 +29,7 @@ with open("results.tsv", "w") as results:
         variants = ("before", "after") if round_number % 2 else ("after", "before")
         for variant in variants:
             completed = subprocess.run(
-                [
-                    os.path.join(binaries_dir, variant + suffix),
-                    "repository::tests::bench_branches",
-                    "--exact",
-                    "--nocapture",
-                    "--test-threads=1",
-                ],
+                [os.path.join(binaries_dir, variant + suffix)],
                 env=environment,
                 capture_output=True,
                 text=True,
