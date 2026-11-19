@@ -15,6 +15,7 @@ names = [
     name
     for name in [
         "linux-stale",
+        "linux-shared-tip",
         "zed",
         "zed-behind",
         "linux",

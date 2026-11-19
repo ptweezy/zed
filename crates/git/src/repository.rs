@@ -431,7 +431,8 @@ pub fn parse_worktrees_from_str<T: AsRef<str>>(
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Upstream {
     pub ref_name: SharedString,
-    /// Computed only for the checked-out branch. Other branches are `Tracked` with zero counts.
+    /// Computed only for the checked-out branch. Other branches are `Tracked` with zero counts,
+    /// and so is the checked-out branch if counting fails, which sets `BranchesScanResult::error`.
     pub tracking: UpstreamTracking,
 }
 
@@ -1162,6 +1163,9 @@ pub struct RealGitRepository {
     pub system_git_binary_path: Option<PathBuf>,
     pub any_git_binary_path: PathBuf,
     any_git_binary_help_output: Arc<Mutex<Option<SharedString>>>,
+    /// The full ref name, as git printed it, of the checked-out branch in the last `branches()`
+    /// listing, if that branch had an upstream.
+    last_head_with_upstream: Arc<Mutex<Option<Vec<u8>>>>,
     executor: BackgroundExecutor,
     is_trusted: Arc<AtomicBool>,
 }
@@ -1261,6 +1265,7 @@ impl RealGitRepository {
             any_git_binary_path,
             executor,
             any_git_binary_help_output: Arc::new(Mutex::new(None)),
+            last_head_with_upstream: Arc::new(Mutex::new(None)),
             is_trusted: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -2167,6 +2172,7 @@ impl GitRepository for RealGitRepository {
 
     fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>> {
         let git = self.git_binary();
+        let last_head_with_upstream = self.last_head_with_upstream.clone();
         self.executor
             .spawn(async move {
                 let fields = [
@@ -2187,9 +2193,17 @@ impl GitRepository for RealGitRepository {
                     "--format",
                     &fields,
                 ];
+                // `%(upstream:track)` walks the history between a branch and its upstream, so only
+                // the checked-out branch reads it, by name. That read starts alongside the listing
+                // for the last listing's head, and is dropped, which kills it, unless that branch
+                // is still the listed head and has an upstream.
+                let guessed_head_read = last_head_with_upstream.lock().clone().map(|ref_name| {
+                    let read = read_upstream(&git, &ref_name);
+                    (ref_name, read)
+                });
                 let output = git.build_command(&args).output().await?;
 
-                let error = if output.status.success() {
+                let mut error = if output.status.success() {
                     None
                 } else {
                     let error = format_branch_scan_error(&output);
@@ -2199,14 +2213,28 @@ impl GitRepository for RealGitRepository {
 
                 let input = String::from_utf8_lossy(&output.stdout);
                 let mut branches = parse_branch_input(&input)?;
-                // `%(upstream:track)` walks the history between every branch and its upstream,
-                // so only the checked-out branch gets it, and only if the listing doesn't show
-                // its upstream at the same commit.
                 let head = branches
-                    .iter()
-                    .position(|branch| branch.is_head && needs_upstream_count(branch, &branches));
-                if let Some(head) = head.and_then(|head| branches.get_mut(head)) {
-                    update_upstream_tracking(&git, head).await.log_err();
+                    .iter_mut()
+                    .find(|branch| branch.is_head && branch.upstream.is_some());
+                // The parsed name is lossy, so the read names the head with the listing's bytes.
+                let head_ref_name = head
+                    .as_ref()
+                    .and_then(|_| listed_head_ref_name(&output.stdout));
+                *last_head_with_upstream.lock() = head_ref_name.map(<[u8]>::to_vec);
+                if let Some(head) = head
+                    && let Some(head_ref_name) = head_ref_name
+                {
+                    match read_head_upstream(&git, head_ref_name, guessed_head_read).await {
+                        Ok(upstream) => head.upstream = upstream,
+                        Err(tracking_error) => {
+                            let tracking_error = format!(
+                                "failed to get upstream tracking of {}: {tracking_error:#}",
+                                head.name()
+                            );
+                            log::warn!("{tracking_error}");
+                            error.get_or_insert(tracking_error.into());
+                        }
+                    }
                 }
                 if branches.is_empty() {
                     let args = vec!["symbolic-ref", "--quiet", "HEAD"];
@@ -4182,41 +4210,74 @@ fn format_branch_scan_error(output: &Output) -> String {
     }
 }
 
-/// A branch without an upstream has no counts, and one at its listed upstream's commit has zero.
-fn needs_upstream_count(branch: &Branch, branches: &[Branch]) -> bool {
-    let (Some(upstream), Some(commit)) = (&branch.upstream, &branch.most_recent_commit) else {
-        return false;
-    };
-    !branches.iter().any(|listed| {
-        listed.ref_name == upstream.ref_name
-            && listed
-                .most_recent_commit
-                .as_ref()
-                .is_some_and(|listed_commit| listed_commit.sha == commit.sha)
-    })
+fn listed_head_ref_name(listing: &[u8]) -> Option<&[u8]> {
+    listing
+        .split(|byte| *byte == b'\n')
+        .find(|line| line.starts_with(b"*\0"))?
+        .split(|byte| *byte == b'\0')
+        .nth(3)
 }
 
-async fn update_upstream_tracking(git: &GitBinary, branch: &mut Branch) -> Result<()> {
-    // `HEAD` and the upstream may have changed since the listing, so name the listed branch and
-    // read its upstream with the counts.
-    let output = git
-        .run(&[
-            "for-each-ref",
-            "--format=%(upstream)%00%(upstream:track)",
-            &branch.ref_name,
-        ])
-        .await?;
+fn read_upstream(git: &GitBinary, ref_name: &[u8]) -> Task<std::io::Result<Output>> {
+    let ref_name = ref_name_argument(ref_name);
+    let mut command = git.build_command(&[
+        OsStr::new("for-each-ref"),
+        OsStr::new("--format=%(refname)%00%(upstream)%00%(upstream:track)"),
+        ref_name.as_os_str(),
+    ]);
+    command.kill_on_drop(true);
+    git.executor.spawn(async move { command.output().await })
+}
+
+#[cfg(unix)]
+fn ref_name_argument(ref_name: &[u8]) -> OsString {
+    use std::os::unix::ffi::OsStrExt as _;
+    OsStr::from_bytes(ref_name).to_os_string()
+}
+
+// Windows passes arguments as UTF-16, so a ref name that isn't UTF-8 can't be named.
+#[cfg(not(unix))]
+fn ref_name_argument(ref_name: &[u8]) -> OsString {
+    String::from_utf8_lossy(ref_name).into_owned().into()
+}
+
+/// Reads the upstream of the listed head with its counts. The guessed read started before the
+/// listing, so the head is read again unless the guess read that branch and found it.
+async fn read_head_upstream(
+    git: &GitBinary,
+    head_ref_name: &[u8],
+    guessed_read: Option<(Vec<u8>, Task<std::io::Result<Output>>)>,
+) -> Result<Option<Upstream>> {
+    if let Some((_, read)) = guessed_read.filter(|(ref_name, _)| ref_name == head_ref_name)
+        && let Ok(upstream) = parse_upstream(read.await, head_ref_name)
+    {
+        return Ok(upstream);
+    }
+    parse_upstream(read_upstream(git, head_ref_name).await, head_ref_name)
+}
+
+fn parse_upstream(output: std::io::Result<Output>, ref_name: &[u8]) -> Result<Option<Upstream>> {
+    let output = output?;
+    anyhow::ensure!(output.status.success(), format_branch_scan_error(&output));
     let (upstream_name, upstream_track) =
-        output.split_once('\0').context("branch no longer exists")?;
-    branch.upstream = if upstream_name.is_empty() {
-        None
-    } else {
-        Some(Upstream {
-            ref_name: upstream_name.into(),
-            tracking: parse_upstream_track(upstream_track)?,
-        })
-    };
-    Ok(())
+        find_upstream(&output.stdout, ref_name).context("the branch no longer exists")?;
+    if upstream_name.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Upstream {
+        ref_name: String::from_utf8_lossy(upstream_name).into_owned().into(),
+        tracking: parse_upstream_track(&String::from_utf8_lossy(upstream_track))?,
+    }))
+}
+
+fn find_upstream<'a>(output: &'a [u8], ref_name: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
+    output.split(|byte| *byte == b'\n').find_map(|line| {
+        let mut fields = line
+            .strip_prefix(ref_name)?
+            .strip_prefix(b"\0")?
+            .splitn(2, |byte| *byte == b'\0');
+        Some((fields.next()?, fields.next()?))
+    })
 }
 
 fn parse_upstream_track(upstream_track: &str) -> Result<UpstreamTracking> {
@@ -6076,8 +6137,6 @@ mod tests {
         git_command(path, ["branch", "deleted"]);
         git_command(path, ["commit", "--allow-empty", "-m", "second"]);
         git_command(path, ["branch", "--set-upstream-to=main", "behind_main"]);
-        git_command(path, ["branch", "at_main"]);
-        git_command(path, ["branch", "--set-upstream-to=main", "at_main"]);
         git_command(path, ["branch", "--set-upstream-to=deleted", "main"]);
         git_command(path, ["branch", "-D", "deleted"]);
         git_command(path, ["update-ref", "refs/custom/main", "main"]);
@@ -6087,6 +6146,10 @@ mod tests {
         git_command(path, ["remote", "add", "origin", "."]);
         git_command(path, ["update-ref", "refs/remotes/origin/v1", "v1"]);
         git_command(path, ["branch", "--set-upstream-to=origin/v1", "tagged"]);
+        // `rev-list` would resolve this name as a revision, but it is not a ref, so it is gone.
+        git_command(path, ["branch", "revision"]);
+        git_command(path, ["config", "branch.revision.remote", "."]);
+        git_command(path, ["config", "branch.revision.merge", "main~1"]);
         git_command(path, ["checkout", "-b", "diverged", "behind_main"]);
         git_command(path, ["commit", "--allow-empty", "-m", "third"]);
         git_command(path, ["branch", "--set-upstream-to=main", "diverged"]);
@@ -6102,48 +6165,165 @@ mod tests {
             ahead: 1,
             behind: 1,
         });
-        let up_to_date = UpstreamTracking::Tracked(UpstreamTrackingStatus::default());
         for (branch_name, upstream_name, expected_tracking) in [
-            ("at_main", "refs/heads/main", up_to_date),
             ("behind_main", "refs/heads/main", behind_by_one),
             ("diverged", "refs/heads/main", ahead_and_behind_by_one),
             ("main", "refs/heads/deleted", UpstreamTracking::Gone),
             ("custom", "refs/custom/main", behind_by_one),
             ("tagged", "refs/remotes/origin/v1", behind_by_one),
+            ("revision", "main~1", UpstreamTracking::Gone),
         ] {
             git_command(path, ["checkout", branch_name]);
-            let branches = repo.branches().await.unwrap().branches;
-            let head = branches.iter().find(|branch| branch.is_head).unwrap();
-            assert_eq!(head.name(), branch_name);
-            assert_eq!(
-                head.upstream,
-                Some(Upstream {
-                    ref_name: upstream_name.into(),
-                    tracking: expected_tracking,
-                }),
-                "{branch_name}"
-            );
+            // The first listing after a checkout reads the head after the listing, and the next
+            // one reads it alongside.
+            for _ in 0..2 {
+                let BranchesScanResult { branches, error } = repo.branches().await.unwrap();
+                assert_eq!(error, None, "{branch_name}");
+                let head = branches.iter().find(|branch| branch.is_head).unwrap();
+                assert_eq!(head.name(), branch_name);
+                assert_eq!(
+                    head.upstream,
+                    Some(Upstream {
+                        ref_name: upstream_name.into(),
+                        tracking: expected_tracking,
+                    }),
+                    "{branch_name}"
+                );
+            }
         }
 
-        // `HEAD` and the upstream can change between the listing and the count.
-        git_command(path, ["checkout", "behind_main"]);
-        let mut branches = repo.branches().await.unwrap().branches;
-        let head = branches.iter_mut().find(|branch| branch.is_head).unwrap();
-        git_command(path, ["checkout", "main"]);
+        // After a checkout, the guessed read names the previous branch.
         git_command(
             path,
             ["branch", "--set-upstream-to=diverged", "behind_main"],
         );
-        update_upstream_tracking(&repo.git_binary(), head)
-            .await
-            .unwrap();
+        let git = repo.git_binary();
+        let guessed_read = (
+            b"refs/heads/main".to_vec(),
+            read_upstream(&git, b"refs/heads/main"),
+        );
         assert_eq!(
-            head.upstream,
+            read_head_upstream(&git, b"refs/heads/behind_main", Some(guessed_read))
+                .await
+                .unwrap(),
             Some(Upstream {
                 ref_name: "refs/heads/diverged".into(),
                 tracking: behind_by_one,
             })
         );
+
+        // The guessed read can also run before the listed head exists.
+        let guessed_read = (
+            b"refs/heads/new".to_vec(),
+            Task::ready(read_upstream(&git, b"refs/heads/new").await),
+        );
+        git_command(path, ["branch", "new", "behind_main"]);
+        git_command(path, ["branch", "--set-upstream-to=main", "new"]);
+        assert_eq!(
+            read_head_upstream(&git, b"refs/heads/new", Some(guessed_read))
+                .await
+                .unwrap(),
+            Some(Upstream {
+                ref_name: "refs/heads/main".into(),
+                tracking: behind_by_one,
+            })
+        );
+    }
+
+    #[gpui::test]
+    async fn test_branches_upstream_tracking_failure(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        git_command(path, ["commit", "--allow-empty", "-m", "first"]);
+        git_command(path, ["branch", "upstream"]);
+        // The listing reads only the head's commit, but counting walks into its missing parent.
+        let tree = git_command_output(path, ["rev-parse", "HEAD^{tree}"]);
+        let missing_parent = "1".repeat(git_command_output(path, ["rev-parse", "HEAD"]).len());
+        fs::write(
+            path.join(".git/commit"),
+            format!(
+                "tree {tree}\nparent {missing_parent}\nauthor test <test@zed.dev> 1 +0000\ncommitter test <test@zed.dev> 1 +0000\n\nsecond\n"
+            ),
+        )
+        .unwrap();
+        let commit = git_command_output(path, ["hash-object", "-t", "commit", "-w", ".git/commit"]);
+        git_command(path, ["update-ref", "refs/heads/main", commit.as_str()]);
+        git_command(path, ["branch", "--set-upstream-to=upstream"]);
+
+        let repo =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        // The first listing reads the head after the listing, and the next one reads it alongside.
+        for _ in 0..2 {
+            let BranchesScanResult { branches, error } = repo.branches().await.unwrap();
+            assert!(
+                error.as_deref().is_some_and(
+                    |error| error.starts_with("failed to get upstream tracking of main")
+                ),
+                "{error:?}"
+            );
+            assert_eq!(branches.len(), 2);
+            let head = branches.iter().find(|branch| branch.is_head).unwrap();
+            assert_eq!(head.name(), "main");
+            assert_eq!(
+                head.upstream,
+                Some(Upstream {
+                    ref_name: "refs/heads/upstream".into(),
+                    tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus::default()),
+                })
+            );
+        }
+    }
+
+    // macOS file systems reject ref files whose names aren't UTF-8.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    async fn test_branches_upstream_tracking_non_utf8_branch(cx: &mut TestAppContext) {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let path = repo_dir.path();
+        git_init_repo(path);
+        git_command(path, ["commit", "--allow-empty", "-m", "first"]);
+        git_command(path, ["commit", "--allow-empty", "-m", "second"]);
+        git_command(
+            path,
+            [
+                OsStr::new("checkout"),
+                OsStr::new("-b"),
+                OsStr::from_bytes(b"caf\xe9"),
+                OsStr::new("main~1"),
+            ],
+        );
+        git_command(path, ["branch", "--quiet", "--set-upstream-to=main"]);
+
+        let repo =
+            RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor())
+                .unwrap();
+        // The first listing reads the head after the listing, and the next one reads it alongside.
+        for _ in 0..2 {
+            let BranchesScanResult { branches, error } = repo.branches().await.unwrap();
+            assert_eq!(error, None);
+            let head = branches.iter().find(|branch| branch.is_head).unwrap();
+            assert_eq!(head.name(), "caf\u{FFFD}");
+            assert_eq!(
+                head.upstream,
+                Some(Upstream {
+                    ref_name: "refs/heads/main".into(),
+                    tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus {
+                        ahead: 0,
+                        behind: 1,
+                    }),
+                })
+            );
+        }
     }
 
     #[test]
