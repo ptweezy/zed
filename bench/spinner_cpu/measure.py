@@ -3,7 +3,7 @@
 import os, platform, re, statistics, subprocess, sys
 here = os.path.dirname(os.path.abspath(__file__))
 runs = int(sys.argv[1]) if len(sys.argv) > 1 else 7
-ext = ".exe" if os.name == "nt" else ""
+ext = ""
 test = "components::label::spinner_label::spinner_cpu_bench::bench_spinner_cpu"
 configs = [(l, hz) for l in ["dots", "sand", "loading"] for hz in [60, 120]]
 def run(binary, label, hz):
