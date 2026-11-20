@@ -12,8 +12,8 @@ build() {
     | python3 -c 'import json,sys; [print(m["executable"]) for m in map(json.loads,sys.stdin) if m.get("reason")=="compiler-artifact" and m.get("executable") and m["target"]["name"]=="ui"]' | tail -1
 }
 cp "$(build)" "$harness/bin/after"
-sed -i 's/\.repeat()\.with_max_fps(max_fps)/.repeat()/' "$f"
-sed -i 's/\.with_max_fps(12\.0),/,/' "$l"
+perl -pi -e 's/\.repeat()\.with_max_fps(max_fps)/.repeat()/' "$f"
+perl -pi -e 's/\.with_max_fps(12\.0),/,/' "$l"
 cp "$(build)" "$harness/bin/before"
 cp "$harness/spinner_label.orig" "$f"; cp "$harness/loading_label.orig" "$l"
 ls -la "$harness/bin"
