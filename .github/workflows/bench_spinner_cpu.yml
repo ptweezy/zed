@@ -1,5 +1,7 @@
 name: bench_spinner_cpu
 on:
+  push:
+    branches: [bench-spinner-max-fps]
   workflow_dispatch:
     inputs:
       runs:
@@ -30,5 +32,5 @@ jobs:
         run: bench/spinner_cpu/build.sh
       - name: Measure
         run: |
-          python3 bench/spinner_cpu/measure.py ${{ inputs.runs }} | tee results.md
+          python3 bench/spinner_cpu/measure.py ${{ inputs.runs || 11 }} | tee results.md
           cat results.md >> "$GITHUB_STEP_SUMMARY"
