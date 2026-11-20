@@ -1,0 +1,84 @@
+name: Measure initial worktree scan
+on:
+  push:
+    branches:
+      - bench-worktree-scan-lock-work
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      # zed-industries/zed#67226's base on main, and its head.
+      BEFORE_COMMIT: 7279c76ef71d45504d7cfea00ee054f852ca0fbf
+      AFTER_COMMIT: 4f5b264b9e2e0274c058be9a8a89396e5b5c1f9b
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: ./script/linux
+      - name: Build both variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags --depth 1 origin "$BEFORE_COMMIT" "$AFTER_COMMIT"
+          git diff --exit-code --stat "$AFTER_COMMIT" HEAD -- crates Cargo.toml Cargo.lock
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          binaries="$RUNNER_TEMP/binaries"
+          mkdir -p "$binaries"
+          source=crates/worktree/src/worktree.rs
+          build() {
+            cargo build --release -p worktree_benchmarks 2>&1 | tee "$RUNNER_TEMP/build-$1.log"
+            cp "target/release/worktree-benchmarks$suffix" "$binaries/$1$suffix"
+          }
+          build after
+          git show "$BEFORE_COMMIT:$source" > "$source"
+          build before
+          git checkout -- "$source"
+          grep -q 'Compiling worktree v' "$RUNNER_TEMP/build-before.log"
+          if cmp -s "$binaries/before$suffix" "$binaries/after$suffix"; then
+            echo "the two binaries are identical" >&2
+            exit 1
+          fi
+          ls -l "$binaries"
+      - name: Clone test trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.longpaths true
+          mkdir -p "$RUNNER_TEMP/trees"
+          cd "$RUNNER_TEMP/trees"
+          for url in https://github.com/zed-industries/zed https://github.com/torvalds/linux https://github.com/mozilla-firefox/firefox; do
+            name=$(basename "$url")
+            git clone --quiet --depth 1 --no-checkout "$url" "$name"
+            if [ "$RUNNER_OS" != Windows ]; then
+              git -C "$name" checkout --quiet HEAD -- .
+            elif ! git -C "$name" -c core.protectNTFS=false checkout --quiet HEAD -- . 2> "$RUNNER_TEMP/checkout-$name.log"; then
+              # Windows can't create some Linux paths, such as aux.c.
+              echo "$name: some paths could not be checked out:"
+              head -20 "$RUNNER_TEMP/checkout-$name.log"
+            fi
+            echo "$name: $(git -C "$name" rev-parse --short HEAD), $(git -C "$name" ls-files | wc -l) tracked files"
+          done
+          git --version
+          df -h .
+      - name: Measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          trees="$RUNNER_TEMP/trees"
+          "$python" bench/worktree_scan_bench/measure.py "$RUNNER_TEMP/binaries" "$GITHUB_STEP_SUMMARY" before after -- "$trees/zed=21" "$trees/linux=21" "$trees/firefox=11"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.os }}
+          path: results.tsv
+          if-no-files-found: ignore
