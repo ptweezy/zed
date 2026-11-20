@@ -11,7 +11,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Run 44657658094 measured all three. Its macOS scans varied by up to 2x
+        # between runs, so this repeats macOS with more runs.
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     env:
@@ -75,7 +77,7 @@ jobs:
           set -euo pipefail
           python=$(command -v python3 || command -v python)
           trees="$RUNNER_TEMP/trees"
-          "$python" bench/worktree_scan_bench/measure.py "$RUNNER_TEMP/binaries" "$GITHUB_STEP_SUMMARY" before after -- "$trees/zed=21" "$trees/linux=21" "$trees/firefox=11"
+          "$python" bench/worktree_scan_bench/measure.py "$RUNNER_TEMP/binaries" "$GITHUB_STEP_SUMMARY" before after -- "$trees/zed=101" "$trees/linux=101" "$trees/firefox=41"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
