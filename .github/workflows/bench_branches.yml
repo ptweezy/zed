@@ -1,0 +1,102 @@
+name: Measure branch listing
+on:
+  push:
+    branches:
+      - bench-branches-slim
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      MAIN_COMMIT: d5615304a1acd9573951aaf462bb46450b1b710b
+      PREVIOUS_COMMIT: 0ff9ad260ac29153bc9d5d72773f7757784eca76
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: ./script/linux
+      - name: Clone test repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.longpaths true
+          mkdir -p "$RUNNER_TEMP/repositories"
+          cd "$RUNNER_TEMP/repositories"
+          for url in https://github.com/torvalds/linux https://github.com/zed-industries/zed https://github.com/mozilla-firefox/firefox; do
+            git clone --quiet --filter=tree:0 --no-checkout "$url"
+          done
+          for name in linux-stale linux-stale-detached; do
+            git clone --quiet --shared --no-checkout linux "$name"
+            for tag in $(git -C "$name" tag --sort=creatordate | grep -E '^v[0-9]+\.[0-9]+$' | tail -50); do
+              git -C "$name" branch --quiet --no-track "old/$tag" "$tag^{commit}"
+              git -C "$name" branch --quiet --set-upstream-to=origin/master "old/$tag"
+            done
+          done
+          oldest=$(git -C linux-stale for-each-ref --sort=committerdate --count=1 --format='%(refname:short)' refs/heads/old/)
+          git -C linux-stale worktree add --quiet --no-checkout ../linux-stale-behind "$oldest"
+          git clone --quiet --shared --no-checkout linux linux-shared-tip
+          for tag in $(git -C linux-shared-tip tag --sort=creatordate | grep -E '^v[0-9]+\.[0-9]+$' | tail -50); do
+            git -C linux-shared-tip branch --quiet --no-track "old/$tag" "$tag^{commit}"
+            git -C linux-shared-tip branch --quiet --no-track "shared/$tag" HEAD
+            git -C linux-shared-tip branch --quiet --set-upstream-to="old/$tag" "shared/$tag"
+          done
+          oldest=$(git -C linux-stale-detached for-each-ref --sort=committerdate --count=1 --format='%(objectname)' refs/heads/old/)
+          git -C linux-stale-detached update-ref --no-deref HEAD "$oldest"
+          cp -R zed zed-behind
+          git clone --quiet --shared --no-checkout linux linux-behind
+          for name in zed-behind linux-behind; do
+            branch=$(git -C "$name" symbolic-ref --short HEAD)
+            git -C "$name" update-ref "refs/heads/$branch" "refs/heads/$branch~3"
+          done
+          git --version
+          for name in linux-stale linux-shared-tip zed zed-behind linux linux-behind firefox linux-stale-detached linux-stale-behind; do
+            listed=$(git -C "$name" for-each-ref --format=x 'refs/heads/**/*' 'refs/remotes/**/*' | wc -l)
+            head=$(git -C "$name" symbolic-ref --quiet --short HEAD || git -C "$name" rev-parse --short HEAD)
+            echo "$name: $listed listed refs, HEAD $head $(git -C "$name" for-each-ref --format='%(upstream:track)' "refs/heads/$head" 2>/dev/null)"
+          done
+      - name: Build three variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          binaries="$RUNNER_TEMP/binaries"
+          mkdir -p "$binaries"
+          source=crates/git/src/repository.rs
+          build() {
+            cargo build --release -p git --example bench_branches
+            cp "target/release/examples/bench_branches$suffix" "$binaries/$1$suffix"
+          }
+          build current
+          git fetch --quiet --no-tags --depth 1 origin "$MAIN_COMMIT" "$PREVIOUS_COMMIT"
+          git show "$PREVIOUS_COMMIT:$source" > "$source"
+          build previous
+          git show "$MAIN_COMMIT:$source" > "$source"
+          build before
+          contains() { grep -q -a -- "$2" "$binaries/$1$suffix"; }
+          contains current 'unexpected git cat-file output'
+          contains previous 'git cat-file printed'
+          if contains current 'git cat-file printed' || contains previous 'unexpected git cat-file output' || contains before 'failed to get upstream tracking'; then
+            echo "a binary contains another variant's code" >&2
+            exit 1
+          fi
+          ls -l "$binaries"
+      - name: Measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          "$python" bench/branches_bench/measure.py "$RUNNER_TEMP/binaries" "$RUNNER_TEMP/repositories" "$GITHUB_STEP_SUMMARY" before previous current
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.os }}
+          path: results.tsv
+          if-no-files-found: ignore

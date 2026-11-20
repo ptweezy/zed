@@ -6995,6 +6995,7 @@ dependencies = [
  "file_content",
  "futures 0.3.34",
  "gpui",
+ "gpui_platform",
  "http_client",
  "itertools 0.14.0",
  "log",
