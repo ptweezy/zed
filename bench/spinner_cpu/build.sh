@@ -14,6 +14,7 @@ build() {
 cp "$(build)" "$harness/bin/after"
 perl -pi -e 's/\.repeat()\.with_max_fps(max_fps)/.repeat()/' "$f"
 perl -pi -e 's/\.with_max_fps(12\.0),/,/' "$l"
+git diff --quiet -- "$l" && { echo "revert did not apply"; exit 1; }
 cp "$(build)" "$harness/bin/before"
 cp "$harness/spinner_label.orig" "$f"; cp "$harness/loading_label.orig" "$l"
 ls -la "$harness/bin"
