@@ -1,0 +1,34 @@
+name: bench_spinner_cpu
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        default: "11"
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: ./script/linux
+      - name: CPU info
+        run: |
+          case "$RUNNER_OS" in
+            Linux) lscpu | head -20 ;;
+            macOS) sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize ;;
+            Windows) powershell -c "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed" ;;
+          esac
+      - name: Build
+        run: bench/spinner_cpu/build.sh
+      - name: Measure
+        run: |
+          python3 bench/spinner_cpu/measure.py ${{ inputs.runs }} | tee results.md
+          cat results.md >> "$GITHUB_STEP_SUMMARY"
