@@ -63,9 +63,11 @@ impl Animation {
     }
 
     /// Limit how often this animation re-renders. Instead of re-rendering on
-    /// every frame, the animation schedules its next render `1 / max_fps`
-    /// seconds after the current one. Values that are not finite and positive
-    /// are ignored.
+    /// every frame, the animation schedules its next render just after the next
+    /// multiple of `1 / max_fps` seconds on its clock. An animation whose value
+    /// changes `max_fps` times a second then renders each change on time, and
+    /// synced animations render together. Values that are not finite and
+    /// positive are ignored.
     pub fn with_max_fps(mut self, max_fps: f32) -> Self {
         self.max_fps = Some(max_fps);
         self
@@ -389,12 +391,13 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         window.with_element_state(global_id.unwrap(), |state, window| {
+            let now = cx.background_executor().now();
             let mut state = state.unwrap_or_else(|| AnimationState {
-                start: cx.background_executor().now(),
+                start: now,
                 animation_ix: 0,
                 delayed_frame_pending: Rc::new(Cell::new(false)),
             });
-            let (animation_ix, delta, done, bench_elapsed) = if cx.reduce_motion() {
+            let (animation_ix, delta, done, elapsed) = if cx.reduce_motion() {
                 let animation_ix = self.animations.len() - 1;
                 let delta = if self.animations[animation_ix].oneshot {
                     1.0
@@ -407,11 +410,11 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                 let duration = self.animations[animation_ix].duration;
 
                 let elapsed = if self.animations[animation_ix].synced && !duration.is_zero() {
-                    let elapsed = cx.background_executor().now() - cx.synced_animation_epoch;
+                    let elapsed = now - cx.synced_animation_epoch;
                     // Reduce modulo the duration before f32 conversion, which loses sub-second precision at scale.
                     Duration::from_nanos((elapsed.as_nanos() % duration.as_nanos()) as u64)
                 } else {
-                    cx.background_executor().now() - state.start
+                    now - state.start
                 };
                 let mut delta = elapsed.as_secs_f32() / duration.as_secs_f32();
 
@@ -421,7 +424,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                         if animation_ix >= self.animations.len() - 1 {
                             done = true;
                         } else {
-                            state.start = cx.background_executor().now();
+                            state.start = now;
                             state.animation_ix += 1;
                         }
                         delta = 1.0;
@@ -446,18 +449,23 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                             let delayed_frame_pending = state.delayed_frame_pending.clone();
                             let view = window.current_view();
                             let interval = Duration::from_secs_f32(1.0 / max_fps);
-                            // Bench: wake 1 ms after the next multiple of `interval` on the
-                            // animation's clock instead of `interval` after this render.
-                            let delay = if bench_aligned() {
-                                let phase = Duration::from_nanos(
-                                    (bench_elapsed.as_nanos() % interval.as_nanos()) as u64,
-                                );
-                                interval - phase + Duration::from_millis(1)
-                            } else {
-                                interval
-                            };
+                            // Wake at a fixed point on the animation's clock rather than an
+                            // interval after this render, so changes render on time and
+                            // animations sharing a clock wake, and render, together. The
+                            // margin keeps float rounding from rendering the old value.
+                            let phase = elapsed.as_nanos() % interval.as_nanos().max(1);
+                            let phase = Duration::from_nanos(phase as u64);
+                            let wake_at = now + interval - phase + Duration::from_millis(1);
                             window
                                 .spawn(cx, async move |cx| {
+                                    // Bench: `before` and the PR as pushed wait an interval.
+                                    let delay = if bench_aligned() {
+                                        wake_at.saturating_duration_since(
+                                            cx.background_executor().now(),
+                                        )
+                                    } else {
+                                        interval
+                                    };
                                     cx.background_executor().timer(delay).await;
                                     delayed_frame_pending.set(false);
                                     cx.update(move |_, cx| cx.notify(view)).ok();
@@ -969,6 +977,18 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(105));
         cx.run_until_parked();
         assert_deltas_approx_eq(&[0.0, 0.105, 0.21]);
+    }
+
+    #[gpui::test]
+    fn test_max_fps_renders_on_the_animation_clock(cx: &mut TestAppContext) {
+        // Mount 30 ms into the shared clock's first 100 ms interval.
+        cx.executor().advance_clock(Duration::from_millis(30));
+        let (rendered_deltas, _window) = open_test_window_with_max_fps(cx, Some(10.0));
+
+        // The next render follows the clock's 100 ms mark, not 100 ms after the first.
+        cx.executor().advance_clock(Duration::from_millis(75));
+        cx.run_until_parked();
+        assert_eq!(rendered_deltas.borrow().len(), 2);
     }
 
     #[gpui::test]
