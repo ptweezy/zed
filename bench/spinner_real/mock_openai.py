@@ -14,7 +14,7 @@ Other requests (thread titles) get a one-word answer.
 
 Once the thread reaches its state, a line is appended to <marker-file>.
 """
-import itertools, json, sys, threading, time
+import itertools, json, socketserver, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port, mode, marker = int(sys.argv[1]), sys.argv[2], sys.argv[3]
@@ -132,7 +132,15 @@ class Handler(BaseHTTPRequestHandler):
         raise SystemExit(f"unknown mode {mode}")
 
 
-server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer resolves the host's name here, which makes macOS ask for
+        # local network access and stalls the stream until someone answers.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+server = Server(("127.0.0.1", port), Handler)
 server.daemon_threads = True
 sys.stderr.write(f"mock: listening on {port} mode={mode}\n")
 server.serve_forever()

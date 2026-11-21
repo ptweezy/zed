@@ -192,6 +192,11 @@ def main():
                               stderr=open(os.path.join(RESULTS, f"mock-{mode}.log"), "w"))
              for mode, port in PORTS.items()]
     compositor_pid = compositor()
+    awake = None
+    if sys.platform == "darwin":
+        # A sleeping display stops frames for every window.
+        subprocess.run(["sudo", "-n", "pmset", "-a", "displaysleep", "0", "sleep", "0"], capture_output=True)
+        awake = subprocess.Popen(["caffeinate", "-dimsu"])
     rows = []
     try:
         time.sleep(1)
@@ -216,6 +221,8 @@ def main():
     finally:
         for mock in mocks:
             mock.kill()
+        if awake:
+            awake.kill()
     others = [variant for variant in VARIANTS if variant != "before"]
     print()
     print(f"Medians of {runs} runs per variant, rotating order; {WINDOW:.0f} s windows")
