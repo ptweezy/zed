@@ -178,6 +178,8 @@ def run_once(scenario, variant, compositor_pid, shot=None):
 
 
 def main():
+    # The Windows console encoding can't print the arrows in the summary.
+    sys.stdout.reconfigure(encoding="utf-8")
     runs = int(sys.argv[1])
     scenarios = sys.argv[2].split(",")
     os.makedirs(os.path.join(PROJECT, "src"), exist_ok=True)
