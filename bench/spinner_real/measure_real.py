@@ -56,6 +56,7 @@ def settings(port):
         "auto_update": False,
         "auto_install_extensions": {"html": False},
         "enable_language_server": False,
+        "session": {"trust_all_worktrees": True},
         "language_models": {
             "openai_compatible": {
                 "bench": {
@@ -100,10 +101,21 @@ def shell_bus_address(shell_pid):
 
 def start_shell(hz):
     socket = os.path.join(RUNTIME, DISPLAY_NAME)
-    subprocess.run(["pkill", "-f", f"^gnome-shell --headless.*{DISPLAY_NAME}"])
-    deadline = time.time() + 10
-    while os.path.exists(socket) and time.time() < deadline:
+    pattern = f"^gnome-shell --headless.*{DISPLAY_NAME}"
+
+    def running():
+        return subprocess.run(["pgrep", "-f", pattern], capture_output=True).returncode == 0
+
+    subprocess.run(["pkill", "-f", pattern])
+    deadline = time.time() + 15
+    while running() and time.time() < deadline:
         time.sleep(0.2)
+    if running():
+        subprocess.run(["pkill", "-9", "-f", pattern])
+        time.sleep(1)
+    for leftover in (socket, socket + ".lock"):
+        if os.path.exists(leftover):
+            os.remove(leftover)
     home = os.path.join(WORK, "gs-home")
     env = dict(
         BASE_ENV,
@@ -119,12 +131,14 @@ def start_shell(hz):
         env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
     )
     deadline = time.time() + 30
-    while not os.path.exists(socket):
-        if time.time() > deadline:
+    shell_pid = None
+    while shell_pid is None or not os.path.exists(socket):
+        if time.time() > deadline or process.poll() is not None:
             sys.exit("gnome-shell did not start")
+        children = subprocess.run(["pgrep", "-P", str(process.pid), "-x", "gnome-shell"],
+                                  capture_output=True, text=True).stdout.split()
+        shell_pid = int(children[0]) if children else None
         time.sleep(0.2)
-    shell_pid = int(subprocess.run(["pgrep", "-P", str(process.pid), "-x", "gnome-shell"],
-                                   capture_output=True, text=True).stdout.split()[0])
     time.sleep(3)
     subprocess.run(["gdbus", "call", "--address", shell_bus_address(shell_pid),
                     "--dest", "org.gnome.Shell", "--object-path", "/org/gnome/Shell",

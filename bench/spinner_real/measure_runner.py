@@ -41,6 +41,7 @@ def settings(port):
         "auto_update": False,
         "auto_install_extensions": {"html": False},
         "enable_language_server": False,
+        "session": {"trust_all_worktrees": True},
         "language_models": {
             "openai_compatible": {
                 "bench": {
