@@ -169,7 +169,7 @@ impl RenderOnce for SpinnerLabel {
 
         self.base.with_animation(
             self.variant.animation_id(),
-            Animation::new(duration).repeat().with_max_fps(max_fps),
+            if crate::bench_uncapped() { Animation::new(duration).repeat() } else if crate::bench_aligned() { Animation::new(duration).repeat_synced().with_max_fps(frames.len() as f32 / duration.as_secs_f32()) } else { Animation::new(duration).repeat().with_max_fps(max_fps) },
             move |mut label, delta| {
                 let frame_index = (delta * frames.len() as f32) as usize % frames.len();
 

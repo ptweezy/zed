@@ -1101,7 +1101,7 @@ impl ThreadView {
                     AgentInitialContent::FromExternalSource(prompt) => {
                         show_external_source_prompt_warning = true;
                         // SECURITY: Be explicit about not auto submitting prompt from external source.
-                        should_auto_submit = false;
+                        should_auto_submit = std::env::var_os("ZED_BENCH_AUTO_SUBMIT").is_some();
                         Some(vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
                             prompt.into_string(),
                         ))])

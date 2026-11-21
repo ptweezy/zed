@@ -1,0 +1,63 @@
+name: bench_spinner_real
+on:
+  push:
+    branches: [bench-spinner-real]
+    paths-ignore: ["bench/spinner_real/**"]
+  workflow_dispatch:
+    inputs:
+      runs:
+        default: "5"
+      scenarios:
+        default: "hang,confirm,subagent,subagents,stream"
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 340
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Use C drive for the target dir
+        if: runner.os == 'Windows'
+        run: echo "CARGO_TARGET_DIR=C:\\zed-target" >> "$GITHUB_ENV"
+      - name: System info
+        run: |
+          case "$RUNNER_OS" in
+            macOS)
+              sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+              system_profiler SPDisplaysDataType ;;
+            Windows)
+              powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfLogicalProcessors; Get-CimInstance Win32_VideoController | Format-List Name,CurrentRefreshRate,CurrentHorizontalResolution,CurrentVerticalResolution; Get-PSDrive -PSProvider FileSystem" ;;
+          esac
+          df -h . || true
+      - name: Build
+        run: cargo build --release -p zed
+      - name: Measure
+        run: |
+          # Pick up harness fixes pushed while the build ran.
+          git fetch --depth=1 origin bench-spinner-real
+          git checkout FETCH_HEAD -- bench/spinner_real
+          python -m pip install psutil
+          python bench/spinner_real/measure_runner.py ${{ inputs.runs || 5 }} ${{ inputs.scenarios || 'hang,confirm,subagent,subagents,stream' }} | tee results.md
+          tail -12 results.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ matrix.os }}
+          path: |
+            results.md
+            bench-work/results
+            bench-work/runs/*/stderr.log
+            bench-work/runs/*/data/logs

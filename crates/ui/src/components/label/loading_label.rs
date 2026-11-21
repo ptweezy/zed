@@ -89,9 +89,7 @@ impl RenderOnce for LoadingLabel {
             vec![
                 Animation::new(Duration::from_secs(1)),
                 // After the reveal, only the trailing dots change, four times a second.
-                Animation::new(Duration::from_secs(1))
-                    .repeat()
-                    .with_max_fps(12.0),
+                if crate::bench_uncapped() { Animation::new(Duration::from_secs(1)).repeat() } else if crate::bench_aligned() { Animation::new(Duration::from_secs(1)).repeat().with_max_fps(4.0) } else { Animation::new(Duration::from_secs(1)).repeat().with_max_fps(12.0) },
             ],
             move |mut label, animation_ix, delta| {
                 match animation_ix {

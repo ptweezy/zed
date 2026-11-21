@@ -1532,7 +1532,26 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
             OpenRequestKind::AgentPanel {
                 external_source_prompt,
             } => {
+                let bench_paths = request.open_paths;
+                let bench_open_options = zed::open_options_for_request(
+                    request.open_behavior,
+                    &workspace::SerializedWorkspaceLocation::Local,
+                    cx,
+                );
                 cx.spawn(async move |cx| {
+                    if !bench_paths.is_empty() {
+                        let paths_with_position =
+                            derive_paths_with_position(app_state.fs.as_ref(), bench_paths).await;
+                        open_paths_with_positions(
+                            &paths_with_position,
+                            &[],
+                            false,
+                            app_state.clone(),
+                            bench_open_options,
+                            cx,
+                        )
+                        .await?;
+                    }
                     let multi_workspace =
                         workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
 

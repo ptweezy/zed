@@ -215,6 +215,12 @@ impl<E> AnimationElement<E> {
     }
 }
 
+fn bench_aligned() -> bool {
+    static ALIGNED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("ZED_BENCH_ALIGNED").is_some());
+    *ALIGNED
+}
+
 struct AnimationState {
     start: Instant,
     animation_ix: usize,
@@ -388,14 +394,14 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                 animation_ix: 0,
                 delayed_frame_pending: Rc::new(Cell::new(false)),
             });
-            let (animation_ix, delta, done) = if cx.reduce_motion() {
+            let (animation_ix, delta, done, bench_elapsed) = if cx.reduce_motion() {
                 let animation_ix = self.animations.len() - 1;
                 let delta = if self.animations[animation_ix].oneshot {
                     1.0
                 } else {
                     0.0
                 };
-                (animation_ix, delta, true)
+                (animation_ix, delta, true, Duration::ZERO)
             } else {
                 let animation_ix = state.animation_ix;
                 let duration = self.animations[animation_ix].duration;
@@ -423,7 +429,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                         delta %= 1.0;
                     }
                 }
-                (animation_ix, delta, done)
+                (animation_ix, delta, done, elapsed)
             };
             let delta = (self.animations[animation_ix].easing)(delta);
 
@@ -440,9 +446,19 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                             let delayed_frame_pending = state.delayed_frame_pending.clone();
                             let view = window.current_view();
                             let interval = Duration::from_secs_f32(1.0 / max_fps);
+                            // Bench: wake 1 ms after the next multiple of `interval` on the
+                            // animation's clock instead of `interval` after this render.
+                            let delay = if bench_aligned() {
+                                let phase = Duration::from_nanos(
+                                    (bench_elapsed.as_nanos() % interval.as_nanos()) as u64,
+                                );
+                                interval - phase + Duration::from_millis(1)
+                            } else {
+                                interval
+                            };
                             window
                                 .spawn(cx, async move |cx| {
-                                    cx.background_executor().timer(interval).await;
+                                    cx.background_executor().timer(delay).await;
                                     delayed_frame_pending.set(false);
                                     cx.update(move |_, cx| cx.notify(view)).ok();
                                 })
