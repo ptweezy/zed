@@ -4,7 +4,9 @@
 Usage: measure_real.py <runs> <hz>[,<hz>...] <scenario>[,<scenario>...]
 
 Scenarios: the mock_openai.py modes (hang, confirm, done, stream, subagent,
-subagents), plus hidden: hang with a fullscreen window covering Zed.
+subagents), plus hidden: hang with a fullscreen window covering Zed. Zed's
+window is focused with a synthetic click unless the scenario ends in @bg
+(e.g. hang@bg), which leaves it unfocused, as when another app has focus.
 
 For each refresh rate, this starts a headless GNOME Shell whose virtual monitor
 runs at that rate, then rotates the order of three variants of one bench build:
@@ -122,8 +124,12 @@ def start_shell(hz):
         XDG_CONFIG_HOME=f"{home}/config",
         XDG_DATA_HOME=f"{home}/data",
         XDG_CACHE_HOME=f"{home}/cache",
-        GSETTINGS_BACKEND="memory",
+        GSETTINGS_BACKEND="keyfile",
     )
+    keyfile = os.path.join(home, "config", "glib-2.0", "settings", "keyfile")
+    os.makedirs(os.path.dirname(keyfile), exist_ok=True)
+    with open(keyfile, "w") as file:
+        file.write("[org/gnome/desktop/interface]\nenable-hot-corners=false\nenable-animations=false\n")
     log = open(os.path.join(WORK, f"gs-{hz}.log"), "w")
     process = subprocess.Popen(
         ["dbus-run-session", "--", "gnome-shell", "--headless", "--wayland", "--no-x11",
@@ -195,8 +201,18 @@ def start_occluder(shell_pid):
                             start_new_session=True)
 
 
+def focus_zed(shell_pid):
+    process = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "focus.py"), str(shell_pid)],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    if process.stdout.readline().strip() != b"focused":
+        stop_group(process)
+        raise RuntimeError("could not focus Zed")
+    return process
+
+
 def run_once(scenario, variant, shell_pid, screenshot=None):
-    mode = MODES.get(scenario, scenario)
+    base, _, flag = scenario.partition("@")
+    mode = MODES.get(base, base)
     run_dir = os.path.join(WORK, "runs", f"{scenario}-{variant}")
     shutil.rmtree(run_dir, ignore_errors=True)
     data = os.path.join(run_dir, "data")
@@ -220,8 +236,10 @@ def run_once(scenario, variant, shell_pid, screenshot=None):
             if time.time() > deadline:
                 raise RuntimeError(f"no agent request, see {stderr_path}")
             time.sleep(0.1)
-        if scenario == "hidden":
+        if base == "hidden":
             occluder = start_occluder(shell_pid)
+        elif flag != "bg":
+            occluder = focus_zed(shell_pid)
         time.sleep(SETTLE)
         start = snapshot(zed.pid, shell_pid, stderr_path)
         time.sleep(WINDOW)
