@@ -12,16 +12,24 @@ For each refresh rate, this starts a headless GNOME Shell whose virtual monitor
 runs at that rate, then rotates the order of two variants of one bench build:
   before   ZED_BENCH_UNCAPPED=1: the labels render on every frame (main)
   after    the PR
-Each run starts Zed with a fresh user data dir on
-a small project and zed://agent/?prompt=hi, which the bench build submits to a
-local mock provider. Once the thread reaches its state, the run waits SETTLE
-seconds, then samples WINDOW seconds of:
+BENCH_VARIANTS=before,after,previous adds the bench build of an earlier
+revision, named by BENCH_PREVIOUS and run with ZED_BENCH_ALIGNED=1. Each run
+starts Zed with a fresh user data dir on a small project and
+zed://agent/?prompt=hi, which the bench build submits to a local mock provider.
+Once the thread reaches its state, the run waits SETTLE seconds, then samples
+WINDOW seconds of:
   zed    CPU time of the Zed process, all threads (/proc/<pid>/stat)
   main   CPU time of Zed's main thread (/proc/<pid>/task/<pid>/schedstat)
   shell  CPU time of the compositor process
   frames frames Zed drew (ZED_MEASUREMENTS=1 logs one line per frame)
 BENCH_ZED and BENCH_WORK override the binary (target/release/zed) and the
 scratch dir (bench-work in the checkout).
+
+Other work on the machine changes Zed's own CPU time: a build on ten other
+cores raised it by about 30%, and another app rendering on the same GPU lowered
+it by 10% or more. Each run records the CPU time of everything else ("other").
+With BENCH_MAX_OTHER (ms/s) set, a run starts only once the machine has been
+below that for three seconds, and is repeated if it rose above it.
 """
 import json, os, re, shutil, signal, statistics, subprocess, sys, time
 
@@ -38,6 +46,7 @@ MODES = {"hidden": "hang"}
 PROJECT = os.path.join(WORK, "bench-project")
 OPEN_FILE = os.path.join(PROJECT, "src", "window.rs")
 SETTLE = float(os.environ.get("BENCH_SETTLE", 5))
+MAX_OTHER = float(os.environ.get("BENCH_MAX_OTHER", 0))
 WINDOW = float(os.environ.get("BENCH_WINDOW", 10))
 BASE_ENV = {
     "HOME": os.environ["HOME"],
@@ -87,6 +96,8 @@ def zed_env(run_dir, variant="after"):
     )
     if variant == "before":
         env["ZED_BENCH_UNCAPPED"] = "1"
+    elif variant == "previous":
+        env["ZED_BENCH_ALIGNED"] = "1"
     return env
 
 
@@ -180,12 +191,53 @@ def frames(stderr_path):
         return [float(value) * UNIT_MS[unit] for value, unit in FRAME.findall(file.read())]
 
 
+def system_busy_seconds():
+    with open("/proc/stat") as file:
+        fields = [int(value) for value in file.readline().split()[1:]]
+    # user, nice, system, idle, iowait, irq, softirq, steal
+    return (sum(fields[:8]) - fields[3] - fields[4]) / TICKS_PER_SECOND
+
+
+def idle_state_seconds():
+    """Seconds every CPU has spent in each idle state, summed over CPUs."""
+    totals = {}
+    for cpu in os.listdir("/sys/devices/system/cpu"):
+        states = f"/sys/devices/system/cpu/{cpu}/cpuidle"
+        if not re.fullmatch(r"cpu\d+", cpu) or not os.path.isdir(states):
+            continue
+        for state in os.listdir(states):
+            with open(f"{states}/{state}/name") as file:
+                name = file.read().strip()
+            with open(f"{states}/{state}/time") as file:
+                totals[name] = totals.get(name, 0.0) + int(file.read()) / 1e6
+    return totals
+
+
+def wait_for_quiet():
+    if not MAX_OTHER:
+        return
+    quiet_seconds, announced = 0, False
+    while quiet_seconds < 3:
+        before = system_busy_seconds()
+        time.sleep(1)
+        busy = (system_busy_seconds() - before) * 1e3
+        if busy <= MAX_OTHER:
+            quiet_seconds += 1
+            continue
+        quiet_seconds = 0
+        if not announced:
+            print(f"waiting for a quiet machine: {busy:.0f} ms/s busy at {time.strftime('%H:%M:%S')}", flush=True)
+            announced = True
+
+
 def snapshot(pid, shell_pid, stderr_path):
     return {
         "time": time.monotonic(),
         "zed": process_cpu_seconds(pid),
         "main": thread_cpu_seconds(pid, pid),
         "shell": process_cpu_seconds(shell_pid),
+        "busy": system_busy_seconds(),
+        "idle": idle_state_seconds(),
         "frames": frames(stderr_path),
     }
 
@@ -221,7 +273,8 @@ def run_once(scenario, variant, shell_pid, screenshot=None):
     env = zed_env(run_dir, variant)
     stderr_path = os.path.join(run_dir, "stderr.log")
     with open(stderr_path, "w") as stderr, open(os.path.join(run_dir, "stdout.log"), "w") as stdout:
-        zed = subprocess.Popen([ZED, "--user-data-dir", data, PROJECT, OPEN_FILE, "zed://agent/?prompt=hi"],
+        binary = os.environ["BENCH_PREVIOUS"] if variant == "previous" else ZED
+        zed = subprocess.Popen([binary, "--user-data-dir", data, PROJECT, OPEN_FILE, "zed://agent/?prompt=hi"],
                                env=env, stdout=stdout, stderr=stderr, cwd=run_dir,
                                start_new_session=True)
     occluder = None
@@ -250,12 +303,20 @@ def run_once(scenario, variant, shell_pid, screenshot=None):
             stop_group(occluder)
     elapsed = end["time"] - start["time"]
     window_frames = end["frames"][len(start["frames"]):]
+    zed_ms = (end["zed"] - start["zed"]) * 1e3 / elapsed
+    shell_ms = (end["shell"] - start["shell"]) * 1e3 / elapsed
+    cpus = os.cpu_count()
     return {
-        "zed": (end["zed"] - start["zed"]) * 1e3 / elapsed,
+        "zed": zed_ms,
         "main": (end["main"] - start["main"]) * 1e3 / elapsed,
-        "shell": (end["shell"] - start["shell"]) * 1e3 / elapsed,
+        "shell": shell_ms,
         "fps": len(window_frames) / elapsed,
         "frame_ms": statistics.mean(window_frames) if window_frames else 0.0,
+        # CPU time of everything else on the machine, and the share of all CPU time spent in each idle state.
+        "other": (end["busy"] - start["busy"]) * 1e3 / elapsed - zed_ms - shell_ms,
+        "idle": {name: round((end["idle"][name] - start["idle"].get(name, 0.0)) / (elapsed * cpus), 4)
+                 for name in end["idle"]},
+        "at": time.strftime("%H:%M:%S"),
     }
 
 
@@ -289,10 +350,18 @@ def main():
                             shot = None
                             if index == 0:
                                 shot = os.path.join(WORK, "results", f"{stamp}-{hz}-{scenario}-{variant}.png")
+                            wait_for_quiet()
                             try:
                                 result = run_once(scenario, variant, shell_pid, shot)
                             except RuntimeError as error:
                                 print(f"retrying {hz} {scenario} {variant}: {error}", flush=True)
+                                result = run_once(scenario, variant, shell_pid, shot)
+                            for _ in range(30):
+                                if not MAX_OTHER or result["other"] <= MAX_OTHER:
+                                    break
+                                print(f"busy machine, repeating {hz} {scenario} {variant}: "
+                                      f"zed {result['zed']:.1f}, other {result['other']:.0f} ms/s", flush=True)
+                                wait_for_quiet()
                                 result = run_once(scenario, variant, shell_pid, shot)
                             results[variant].append(result)
                             record = dict(hz=hz, scenario=scenario, variant=variant, index=index, **result)
