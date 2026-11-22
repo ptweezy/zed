@@ -1,11 +1,12 @@
 use std::{
-    sync::LazyLock,
+    sync::{LazyLock, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use gpui::FrameRequestSource;
 use gpui_util::ResultExt;
+use parking_lot::{Condvar, Mutex};
 use windows::Win32::{
     Foundation::HWND,
     Graphics::Dwm::{DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo},
@@ -22,6 +23,38 @@ static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
 
 const VSYNC_INTERVAL_THRESHOLD: Duration = Duration::from_millis(1);
 const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
+/// How often the vsync thread checks for a lost device while no window needs a frame.
+pub(crate) const DEVICE_LOST_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Latches frame requests from the UI thread. The vsync thread blocks while there are none.
+#[derive(Default)]
+pub(crate) struct FrameDemand {
+    requested: Mutex<bool>,
+    condvar: Condvar,
+    /// Whether the UI thread is inside `draw_window`.
+    pub(crate) drawing: AtomicBool,
+}
+
+impl FrameDemand {
+    pub(crate) fn request(&self) {
+        *self.requested.lock() = true;
+        self.condvar.notify_one();
+    }
+
+    /// Returns whether a frame was requested, and clears the request.
+    pub(crate) fn take(&self) -> bool {
+        std::mem::take(&mut *self.requested.lock())
+    }
+
+    /// Like `take`, but first blocks until a frame is requested or `timeout` elapses.
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        let mut requested = self.requested.lock();
+        if !*requested {
+            self.condvar.wait_for(&mut requested, timeout);
+        }
+        std::mem::take(&mut *requested)
+    }
+}
 
 pub(crate) struct VSyncProvider {
     interval: Duration,
@@ -115,5 +148,17 @@ mod tests {
         };
 
         assert_eq!(provider.wait_for_vsync(), FrameRequestSource::LocalSchedule);
+    }
+
+    #[test]
+    fn frame_demand_latches_requests_until_taken() {
+        let demand = FrameDemand::default();
+        assert!(!demand.wait(Duration::ZERO));
+        demand.request();
+        demand.request();
+        assert!(demand.wait(Duration::ZERO));
+        assert!(!demand.take());
+        demand.request();
+        assert!(demand.take());
     }
 }

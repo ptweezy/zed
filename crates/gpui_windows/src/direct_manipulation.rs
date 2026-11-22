@@ -26,6 +26,8 @@ pub(crate) struct DirectManipulationHandler {
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    /// Set from a touchpad contact until the viewport is ready for the next gesture.
+    gesture_active: Rc<Cell<bool>>,
 }
 
 impl DirectManipulationHandler {
@@ -65,12 +67,14 @@ impl DirectManipulationHandler {
 
             let scale_factor = Rc::new(Cell::new(scale_factor));
             let pending_events = Rc::new(RefCell::new(Vec::new()));
+            let gesture_active = Rc::new(Cell::new(false));
 
             let event_handler: IDirectManipulationViewportEventHandler =
                 DirectManipulationEventHandler::new(
                     window,
                     Rc::clone(&scale_factor),
                     Rc::clone(&pending_events),
+                    Rc::clone(&gesture_active),
                 )
                 .into();
 
@@ -86,6 +90,7 @@ impl DirectManipulationHandler {
                 window,
                 scale_factor,
                 pending_events,
+                gesture_active,
             })
         }
     }
@@ -98,11 +103,17 @@ impl DirectManipulationHandler {
         unsafe {
             let pointer_id = wparam.loword() as u32;
             let mut pointer_type = POINTER_INPUT_TYPE::default();
-            if GetPointerType(pointer_id, &mut pointer_type).is_ok() && pointer_type == PT_TOUCHPAD
+            if GetPointerType(pointer_id, &mut pointer_type).is_ok()
+                && pointer_type == PT_TOUCHPAD
+                && self.viewport.SetContact(pointer_id).log_err().is_some()
             {
-                self.viewport.SetContact(pointer_id).log_err();
+                self.gesture_active.set(true);
             }
         }
+    }
+
+    pub fn is_gesture_active(&self) -> bool {
+        self.gesture_active.get()
     }
 
     pub fn update(&self) {
@@ -143,6 +154,7 @@ struct DirectManipulationEventHandler {
     last_y_offset: Cell<f32>,
     scroll_phase: Cell<TouchPhase>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    gesture_active: Rc<Cell<bool>>,
 }
 
 impl DirectManipulationEventHandler {
@@ -150,6 +162,7 @@ impl DirectManipulationEventHandler {
         window: HWND,
         scale_factor: Rc<Cell<f32>>,
         pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+        gesture_active: Rc<Cell<bool>>,
     ) -> Self {
         Self {
             window,
@@ -160,6 +173,7 @@ impl DirectManipulationEventHandler {
             last_y_offset: Cell::new(0.0),
             scroll_phase: Cell::new(TouchPhase::Started),
             pending_events,
+            gesture_active,
         }
     }
 
@@ -242,6 +256,8 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
                             .log_err();
                     }
                 }
+            } else {
+                self.gesture_active.set(false);
             }
 
             self.last_scale.set(1.0);

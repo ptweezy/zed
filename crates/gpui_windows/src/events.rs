@@ -43,12 +43,15 @@ pub(crate) struct DrawCoordinator {
     /// nest GPUI draws. Nested draws are wasted work whose output is
     /// immediately redrawn, so we defer them instead.
     drawing: Cell<bool>,
+    /// Wakes the vsync thread, which then invalidates every window.
+    pub(crate) frame_demand: std::sync::Arc<FrameDemand>,
 }
 
 impl DrawCoordinator {
     pub(crate) fn new() -> Self {
         Self {
             drawing: Cell::new(false),
+            frame_demand: Default::default(),
         }
     }
 
@@ -62,6 +65,7 @@ impl DrawCoordinator {
             None
         } else {
             self.drawing.set(true);
+            self.frame_demand.drawing.store(true, Ordering::Release);
             Some(DrawWindowGuard { coordinator: self })
         }
     }
@@ -74,6 +78,8 @@ struct DrawWindowGuard<'a> {
 impl Drop for DrawWindowGuard<'_> {
     fn drop(&mut self) {
         self.coordinator.drawing.set(false);
+        let frame_demand = &self.coordinator.frame_demand;
+        frame_demand.drawing.store(false, Ordering::Release);
     }
 }
 
@@ -229,6 +235,8 @@ impl WindowsWindowInner {
             self.state
                 .restore_from_minimized
                 .set(self.state.callbacks.request_frame.take());
+            // A minimized window doesn't paint, so a pending vsync timestamp would go stale.
+            self.state.frame_signal.take();
             return Some(0);
         }
 
@@ -1354,6 +1362,8 @@ impl WindowsWindowInner {
 
     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
         self.state.direct_manipulation.on_pointer_hit_test(wparam);
+        // `draw_window` polls the gesture this may have started.
+        self.state.draw_coordinator.frame_demand.request();
         None
     }
 
@@ -1366,16 +1376,24 @@ impl WindowsWindowInner {
             }
             // Validate the region so a nested message pump doesn't keep
             // re-dispatching WM_PAINT for the still-invalid region in a busy
-            // loop until the in-progress draw unwinds. The vsync thread
-            // re-invalidates every window on each vsync (see
+            // loop until the in-progress draw unwinds. The request makes the
+            // vsync thread re-invalidate every window (see
             // `begin_vsync_thread`), so the deferred frame still gets drawn,
             // at most one vsync late.
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+            self.state.draw_coordinator.frame_demand.request();
             return Some(0);
         };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
+        // Validate before drawing: the vsync thread invalidates only on request, so
+        // validating afterward could drop a frame requested during the draw.
+        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
 
         self.state.direct_manipulation.update();
+        // Direct Manipulation reports a touchpad gesture only from `update`.
+        if self.state.direct_manipulation.is_gesture_active() {
+            self.state.draw_coordinator.frame_demand.request();
+        }
 
         let events = self.state.direct_manipulation.drain_events();
         if !events.is_empty() {
@@ -1406,7 +1424,6 @@ impl WindowsWindowInner {
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
-        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
 
         Some(0)
     }

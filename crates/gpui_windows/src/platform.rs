@@ -422,6 +422,7 @@ impl WindowsPlatform {
             // Not joined: the thread can be sending this thread a message. It exits after its
             // next vsync, and drops its reference to the devices then.
             stop.store(true, Ordering::Release);
+            self.inner.state.draw_coordinator.frame_demand.request();
         }
         self.inner.state.directx_devices.borrow_mut().take();
     }
@@ -437,13 +438,29 @@ impl WindowsPlatform {
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
         let invalidate_devices = self.invalidate_devices.clone();
+        let frame_demand = self.inner.state.draw_coordinator.frame_demand.clone();
 
         std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
-                loop {
-                    let signal_source = vsync_provider.wait_for_vsync();
+                let mut last_vsync = None;
+                while !stop.load(Ordering::Acquire) {
+                    // A frame requested during the last vsync wait is paced by that vsync.
+                    // Otherwise block until a window needs one and invalidate right away. The
+                    // timeout only bounds how long a lost device goes unnoticed.
+                    let signal_source = match last_vsync.take() {
+                        // The UI thread is still drawing. The next frame starts on the first
+                        // vsync after it finishes, as it did when every vsync invalidated.
+                        Some(_) if frame_demand.drawing.load(Ordering::Acquire) => {
+                            last_vsync = Some(vsync_provider.wait_for_vsync());
+                            continue;
+                        }
+                        Some(source) if frame_demand.take() => Some(source),
+                        _ => frame_demand
+                            .wait(DEVICE_LOST_POLL_INTERVAL)
+                            .then_some(FrameRequestSource::LocalSchedule),
+                    };
                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
                     if stop.load(Ordering::Acquire) {
                         break;
@@ -460,6 +477,9 @@ impl WindowsPlatform {
                             panic!("Device lost: {err}");
                         }
                     }
+                    let Some(signal_source) = signal_source else {
+                        continue;
+                    };
                     let Some(all_windows) = all_windows.upgrade() else {
                         break;
                     };
@@ -480,6 +500,9 @@ impl WindowsPlatform {
                                 .log_err();
                         }
                     }
+                    // Pace the next frame. While frames keep coming, this wait starts right
+                    // after a vsync and lasts a full interval, as `wait_for_vsync` assumes.
+                    last_vsync = Some(vsync_provider.wait_for_vsync());
                 }
             })
             .unwrap();
@@ -1456,6 +1479,7 @@ impl Drop for WindowsPlatform {
     fn drop(&mut self) {
         if let Some(stop) = self.vsync_stop.borrow_mut().take() {
             stop.store(true, Ordering::Release);
+            self.inner.state.draw_coordinator.frame_demand.request();
         }
         unsafe {
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {

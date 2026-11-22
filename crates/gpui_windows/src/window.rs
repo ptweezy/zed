@@ -269,6 +269,14 @@ impl WindowsWindowInner {
         }
     }
 
+    /// Requests a frame from the vsync thread. A minimized window can't paint, so GPUI would
+    /// repeat its request on every frame of another window.
+    pub(crate) fn schedule_frame(&self) {
+        if !unsafe { IsIconic(self.hwnd) }.as_bool() {
+            self.state.draw_coordinator.frame_demand.request();
+        }
+    }
+
     fn new(context: &mut WindowCreateContext, hwnd: HWND, cs: &CREATESTRUCTW) -> Result<Rc<Self>> {
         let state = WindowsWindowState::new(
             hwnd,
@@ -1041,6 +1049,22 @@ impl PlatformWindow for WindowsWindow {
             .borrow_mut()
             .draw(scene, self.state.background_appearance.get())
             .log_err();
+        // GPUI decides on each frame whether to keep presenting, for example after
+        // high-rate input, so a presented frame requests the next one.
+        self.0.schedule_frame();
+    }
+
+    fn schedule_frame(&self) {
+        self.0.schedule_frame();
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let this = Rc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            if let Some(this) = this.upgrade() {
+                this.schedule_frame();
+            }
+        }))
     }
 
     #[cfg(feature = "test-support")]
