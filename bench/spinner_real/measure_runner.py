@@ -7,7 +7,6 @@ Run from a zed checkout of the bench branch after `cargo build --release -p zed`
 Scenarios are the mock_openai.py modes. Variants rotate order on each run:
   before   ZED_BENCH_UNCAPPED=1: the labels render on every frame (main)
   after    the PR
-  aligned  ZED_BENCH_ALIGNED=1: renders at glyph boundaries on a shared clock
 Each run starts Zed with a fresh user data dir on a small project and
 zed://agent/?prompt=hi, which the bench build submits to a local mock provider.
 Once the thread reaches its state, the run waits SETTLE seconds, then samples
@@ -30,7 +29,7 @@ RESULTS = os.path.join(WORK, "results")
 PORTS = {"hang": 18701, "confirm": 18702, "done": 18703, "stream": 18704, "subagent": 18705, "subagents": 18706}
 SETTLE = float(os.environ.get("BENCH_SETTLE", 5))
 WINDOW = float(os.environ.get("BENCH_WINDOW", 10))
-VARIANTS = os.environ.get("BENCH_VARIANTS", "before,after,aligned").split(",")
+VARIANTS = os.environ.get("BENCH_VARIANTS", "before,after").split(",")
 FRAME = re.compile(r"^frame duration: ([\d.]+)(ns|µs|ms|s)\r?$", re.M)
 UNIT_MS = {"ns": 1e-6, "µs": 1e-3, "ms": 1.0, "s": 1e3}
 
@@ -141,8 +140,6 @@ def run_once(scenario, variant, compositor_pid, shot=None):
     env.update(BENCH_API_KEY="bench", ZED_BENCH_AUTO_SUBMIT="1", ZED_MEASUREMENTS="1")
     if variant == "before":
         env["ZED_BENCH_UNCAPPED"] = "1"
-    elif variant == "aligned":
-        env["ZED_BENCH_ALIGNED"] = "1"
     stderr_path = os.path.join(run_dir, "stderr.log")
     with open(stderr_path, "w") as stderr, open(os.path.join(run_dir, "stdout.log"), "w") as stdout:
         process = subprocess.Popen([ZED, "--user-data-dir", data, PROJECT, OPEN_FILE, "zed://agent/?prompt=hi"],

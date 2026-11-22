@@ -1,5 +1,5 @@
 use scheduler::Instant;
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{cell::Cell, num::NonZeroUsize, rc::Rc, time::Duration};
 
 use crate::{
     AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
@@ -25,6 +25,9 @@ pub struct Animation {
     /// The maximum number of times per second this animation re-renders.
     /// When `None`, the animation re-renders on every frame.
     pub max_fps: Option<f32>,
+    /// The number of equal steps this animation advances in. See [`Animation::with_steps`].
+    /// When `None`, the animation advances continuously.
+    pub steps: Option<NonZeroUsize>,
 }
 
 impl Animation {
@@ -37,6 +40,7 @@ impl Animation {
             synced: false,
             easing: Rc::new(linear),
             max_fps: None,
+            steps: None,
         }
     }
 
@@ -63,13 +67,20 @@ impl Animation {
     }
 
     /// Limit how often this animation re-renders. Instead of re-rendering on
-    /// every frame, the animation schedules its next render just after the next
-    /// multiple of `1 / max_fps` seconds on its clock. An animation whose value
-    /// changes `max_fps` times a second then renders each change on time, and
-    /// synced animations render together. Values that are not finite and
-    /// positive are ignored.
+    /// every frame, the animation schedules its next render `1 / max_fps`
+    /// seconds after the current one. Values that are not finite and positive
+    /// are ignored.
     pub fn with_max_fps(mut self, max_fps: f32) -> Self {
         self.max_fps = Some(max_fps);
+        self
+    }
+
+    /// Advance in `steps` equal steps instead of continuously, like CSS `steps()`.
+    /// The animator receives `0`, then `1 / steps`, and so on. The animation
+    /// re-renders only when it steps, so [`Self::with_max_fps`] has no effect.
+    /// A `steps` of zero is ignored.
+    pub fn with_steps(mut self, steps: usize) -> Self {
+        self.steps = NonZeroUsize::new(steps);
         self
     }
 }
@@ -217,18 +228,38 @@ impl<E> AnimationElement<E> {
     }
 }
 
-fn bench_aligned() -> bool {
-    static ALIGNED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("ZED_BENCH_ALIGNED").is_some());
-    *ALIGNED
-}
-
 struct AnimationState {
     start: Instant,
     animation_ix: usize,
-    /// Whether a throttled re-render (see [`Animation::with_max_fps`]) is
-    /// already scheduled, so overlapping renders don't stack extra timers.
+    /// Whether a delayed re-render (see [`Animation::with_max_fps`] and
+    /// [`Animation::with_steps`]) is already scheduled, so overlapping renders
+    /// don't stack extra timers.
     delayed_frame_pending: Rc<Cell<bool>>,
+}
+
+impl AnimationState {
+    /// Re-renders the current view at `instant`, unless a re-render is already scheduled.
+    fn render_at(&self, instant: Instant, window: &Window, cx: &App) {
+        if self.delayed_frame_pending.replace(true) {
+            return;
+        }
+        let delayed_frame_pending = self.delayed_frame_pending.clone();
+        let view = window.current_view();
+        window
+            .spawn(cx, async move |cx| {
+                // A timer can fire early, and a render before `instant` would repeat the last one.
+                loop {
+                    let delay = instant.saturating_duration_since(cx.background_executor().now());
+                    if delay.is_zero() {
+                        break;
+                    }
+                    cx.background_executor().timer(delay).await;
+                }
+                delayed_frame_pending.set(false);
+                cx.update(move |_, cx| cx.notify(view)).ok();
+            })
+            .detach();
+    }
 }
 
 struct SpringElementState {
@@ -397,14 +428,14 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                 animation_ix: 0,
                 delayed_frame_pending: Rc::new(Cell::new(false)),
             });
-            let (animation_ix, delta, done, elapsed) = if cx.reduce_motion() {
+            let (animation_ix, delta, done, next_step) = if cx.reduce_motion() {
                 let animation_ix = self.animations.len() - 1;
                 let delta = if self.animations[animation_ix].oneshot {
                     1.0
                 } else {
                     0.0
                 };
-                (animation_ix, delta, true, Duration::ZERO)
+                (animation_ix, delta, true, None)
             } else {
                 let animation_ix = state.animation_ix;
                 let duration = self.animations[animation_ix].duration;
@@ -417,9 +448,25 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                     now - state.start
                 };
                 let mut delta = elapsed.as_secs_f32() / duration.as_secs_f32();
+                let mut finished = delta > 1.0;
+                let mut next_step = None;
+                if let Some(steps) = self.animations[animation_ix].steps
+                    && !duration.is_zero()
+                {
+                    // Steps rarely start on a whole nanosecond, so count them in integers.
+                    let (elapsed, duration) = (elapsed.as_nanos(), duration.as_nanos());
+                    let steps = steps.get() as u128;
+                    let step = elapsed * steps / duration;
+                    delta = (step % steps) as f32 / steps as f32;
+                    finished = self.animations[animation_ix].oneshot && step >= steps;
+                    if !finished {
+                        let starts_in = ((step + 1) * duration).div_ceil(steps) - elapsed;
+                        next_step = Some(now + Duration::from_nanos(starts_in as u64));
+                    }
+                }
 
                 let mut done = false;
-                if delta > 1.0 {
+                if finished {
                     if self.animations[animation_ix].oneshot {
                         if animation_ix >= self.animations.len() - 1 {
                             done = true;
@@ -432,7 +479,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                         delta %= 1.0;
                     }
                 }
-                (animation_ix, delta, done, elapsed)
+                (animation_ix, delta, done, next_step)
             };
             let delta = (self.animations[animation_ix].easing)(delta);
 
@@ -441,7 +488,9 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
             let element = self.element.take().expect("should only be called once");
             let mut element = (self.animator)(element, animation_ix, delta).into_any_element();
 
-            if !done {
+            if let Some(next_step) = next_step {
+                state.render_at(next_step, window, cx);
+            } else if !done {
                 match self.animations[animation_ix].max_fps {
                     Some(max_fps) if max_fps.is_finite() && max_fps > 0.0 => {
                         if !state.delayed_frame_pending.get() {
@@ -449,24 +498,9 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                             let delayed_frame_pending = state.delayed_frame_pending.clone();
                             let view = window.current_view();
                             let interval = Duration::from_secs_f32(1.0 / max_fps);
-                            // Wake at a fixed point on the animation's clock rather than an
-                            // interval after this render, so changes render on time and
-                            // animations sharing a clock wake, and render, together. The
-                            // margin keeps float rounding from rendering the old value.
-                            let phase = elapsed.as_nanos() % interval.as_nanos().max(1);
-                            let phase = Duration::from_nanos(phase as u64);
-                            let wake_at = now + interval - phase + Duration::from_millis(1);
                             window
                                 .spawn(cx, async move |cx| {
-                                    // Bench: `before` and the PR as pushed wait an interval.
-                                    let delay = if bench_aligned() {
-                                        wake_at.saturating_duration_since(
-                                            cx.background_executor().now(),
-                                        )
-                                    } else {
-                                        interval
-                                    };
-                                    cx.background_executor().timer(delay).await;
+                                    cx.background_executor().timer(interval).await;
                                     delayed_frame_pending.set(false);
                                     cx.update(move |_, cx| cx.notify(view)).ok();
                                 })
@@ -585,7 +619,7 @@ mod tests {
 
     struct AnimationTestView {
         rendered_deltas: Rc<RefCell<Vec<f32>>>,
-        max_fps: Option<f32>,
+        animation: Animation,
     }
 
     struct SyncedAnimationTestView {
@@ -646,17 +680,9 @@ mod tests {
     impl Render for AnimationTestView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let rendered_deltas = self.rendered_deltas.clone();
-            // The throttled variant syncs to the shared clock so the deltas
-            // follow the test scheduler's clock rather than wall time.
-            let mut animation = Animation::new(Duration::from_secs(1));
-            if let Some(max_fps) = self.max_fps {
-                animation = animation.repeat_synced().with_max_fps(max_fps);
-            } else {
-                animation = animation.repeat();
-            }
             div().size_full().child(div().with_animation(
                 "repeating-animation",
-                animation,
+                self.animation.clone(),
                 move |this, delta| {
                     rendered_deltas.borrow_mut().push(delta);
                     this
@@ -668,19 +694,23 @@ mod tests {
     fn open_test_window(
         cx: &mut TestAppContext,
     ) -> (Rc<RefCell<Vec<f32>>>, WindowHandle<AnimationTestView>) {
-        open_test_window_with_max_fps(cx, None)
+        open_test_window_with_animation(cx, one_second().repeat())
     }
 
-    fn open_test_window_with_max_fps(
+    fn one_second() -> Animation {
+        Animation::new(Duration::from_secs(1))
+    }
+
+    fn open_test_window_with_animation(
         cx: &mut TestAppContext,
-        max_fps: Option<f32>,
+        animation: Animation,
     ) -> (Rc<RefCell<Vec<f32>>>, WindowHandle<AnimationTestView>) {
         let rendered_deltas = Rc::new(RefCell::new(Vec::new()));
         let window = cx.open_window(size(px(100.), px(100.)), {
             let rendered_deltas = rendered_deltas.clone();
             move |_, _| AnimationTestView {
                 rendered_deltas,
-                max_fps,
+                animation,
             }
         });
         cx.run_until_parked();
@@ -949,7 +979,9 @@ mod tests {
 
     #[gpui::test]
     fn test_max_fps_schedules_timer_driven_frames(cx: &mut TestAppContext) {
-        let (rendered_deltas, window) = open_test_window_with_max_fps(cx, Some(10.0));
+        // Synced, so the deltas follow the test scheduler's clock rather than wall time.
+        let capped = one_second().repeat_synced().with_max_fps(10.0);
+        let (rendered_deltas, window) = open_test_window_with_animation(cx, capped);
 
         // The test scheduler's clock jitters forward slightly on each poll,
         // so compare against expectations loosely.
@@ -980,15 +1012,33 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_max_fps_renders_on_the_animation_clock(cx: &mut TestAppContext) {
-        // Mount 30 ms into the shared clock's first 100 ms interval.
-        cx.executor().advance_clock(Duration::from_millis(30));
-        let (rendered_deltas, _window) = open_test_window_with_max_fps(cx, Some(10.0));
+    fn test_synced_steps_render_once_each(cx: &mut TestAppContext) {
+        // Mount 30 ms into a step, after months on the shared clock. A seventh of a
+        // second isn't a whole number of nanoseconds, and floats misplace its steps.
+        let uptime = Duration::from_secs(300 * 24 * 60 * 60) + Duration::from_millis(30);
+        cx.executor().advance_clock(uptime);
+        let sevenths = one_second().repeat_synced().with_steps(7);
+        let (rendered_deltas, window) = open_test_window_with_animation(cx, sevenths);
+        assert_eq!(simulate_next_frame(&window, cx), 0);
 
-        // The next render follows the clock's 100 ms mark, not 100 ms after the first.
-        cx.executor().advance_clock(Duration::from_millis(75));
+        // Rendering again within a step doesn't schedule the next step twice.
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
-        assert_eq!(rendered_deltas.borrow().len(), 2);
+        let steps = [0, 0, 1, 2, 3, 4, 5, 6, 0].map(|step| step as f32 / 7.0);
+        assert_eq!(*rendered_deltas.borrow(), steps);
+    }
+
+    #[gpui::test]
+    fn test_steps_finish_and_repeat_on_time(cx: &mut TestAppContext) {
+        let quarters = one_second().with_steps(4);
+        let (oneshot, _window) = open_test_window_with_animation(cx, quarters.clone());
+        let (repeating, _window) = open_test_window_with_animation(cx, quarters.repeat());
+
+        cx.executor().advance_clock(Duration::from_millis(1500));
+        cx.run_until_parked();
+        assert_eq!(*oneshot.borrow(), [0.0, 0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(*repeating.borrow(), [0.0, 0.25, 0.5, 0.75, 0.0, 0.25, 0.5]);
     }
 
     #[gpui::test]

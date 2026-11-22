@@ -9,11 +9,10 @@ window is focused with a synthetic click unless the scenario ends in @bg
 (e.g. hang@bg), which leaves it unfocused, as when another app has focus.
 
 For each refresh rate, this starts a headless GNOME Shell whose virtual monitor
-runs at that rate, then rotates the order of three variants of one bench build:
+runs at that rate, then rotates the order of two variants of one bench build:
   before   ZED_BENCH_UNCAPPED=1: the labels render on every frame (main)
   after    the PR
-  aligned  ZED_BENCH_ALIGNED=1: renders at glyph boundaries on a shared clock
-BENCH_VARIANTS picks a subset. Each run starts Zed with a fresh user data dir on
+Each run starts Zed with a fresh user data dir on
 a small project and zed://agent/?prompt=hi, which the bench build submits to a
 local mock provider. Once the thread reaches its state, the run waits SETTLE
 seconds, then samples WINDOW seconds of:
@@ -88,8 +87,6 @@ def zed_env(run_dir, variant="after"):
     )
     if variant == "before":
         env["ZED_BENCH_UNCAPPED"] = "1"
-    elif variant == "aligned":
-        env["ZED_BENCH_ALIGNED"] = "1"
     return env
 
 
@@ -276,7 +273,7 @@ def main():
                                str(port), mode, os.path.join(WORK, f"marker-{mode}")],
                               stderr=open(os.path.join(WORK, f"mock-{mode}.log"), "w"))
              for mode, port in PORTS.items()]
-    variants = os.environ.get("BENCH_VARIANTS", "before,after,aligned").split(",")
+    variants = os.environ.get("BENCH_VARIANTS", "before,after").split(",")
     rows = []
     try:
         time.sleep(1)

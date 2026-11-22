@@ -25,10 +25,3 @@ pub fn bench_uncapped() -> bool {
         std::sync::LazyLock::new(|| std::env::var_os("ZED_BENCH_UNCAPPED").is_some());
     *UNCAPPED
 }
-
-#[doc(hidden)]
-pub fn bench_aligned() -> bool {
-    static ALIGNED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("ZED_BENCH_ALIGNED").is_some());
-    *ALIGNED
-}

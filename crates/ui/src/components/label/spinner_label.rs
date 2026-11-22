@@ -163,15 +163,15 @@ impl RenderOnce for SpinnerLabel {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let frames = self.frames.clone();
         let duration = self.duration;
-        // Each render also re-renders the views containing the spinner, so render only as
-        // often as needed to show every glyph at an even pace once frames snap to vsync.
-        let max_fps = 3.0 * frames.len() as f32 / duration.as_secs_f32();
 
         self.base.with_animation(
             self.variant.animation_id(),
-            if crate::bench_uncapped() { Animation::new(duration).repeat() } else if crate::bench_aligned() { Animation::new(duration).repeat_synced().with_max_fps(frames.len() as f32 / duration.as_secs_f32()) } else { Animation::new(duration).repeat().with_max_fps(max_fps) },
+            // Each render also re-renders the views containing the spinner, so render only when
+            // the glyph changes. A shared clock lets spinners change, and render, together.
+            if crate::bench_uncapped() { Animation::new(duration).repeat() } else { Animation::new(duration).repeat_synced().with_steps(frames.len()) },
             move |mut label, delta| {
-                let frame_index = (delta * frames.len() as f32) as usize % frames.len();
+                let scaled = delta * frames.len() as f32;
+                let frame_index = if crate::bench_uncapped() { scaled as usize } else { scaled.round() as usize } % frames.len();
 
                 label.set_text(frames[frame_index]);
                 label
@@ -244,14 +244,13 @@ mod tests {
         cx.run_until_parked();
         let initial_renders = renders.get();
 
-        // One second of a 100 Hz display, during which the spinner shows 10 glyphs.
+        // One second of a 100 Hz display, during which the glyph changes 10 times.
         for _ in 0..100 {
             cx.executor().advance_clock(Duration::from_millis(10));
             cx.update(|window, cx| window.simulate_next_frame(cx));
             cx.run_until_parked();
         }
 
-        let renders = renders.get() - initial_renders;
-        assert!((10..=31).contains(&renders), "rendered {renders} times");
+        assert_eq!(renders.get() - initial_renders, 10);
     }
 }
