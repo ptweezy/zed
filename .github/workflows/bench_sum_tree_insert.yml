@@ -1,0 +1,147 @@
+name: Measure keyed SumTree inserts
+on:
+  push:
+    branches:
+      - bench-sum-tree-insert-in-place
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  # main, and the commit on it that inserts keyed items in place.
+  BEFORE_COMMIT: d31d1074a07b7bbaa43a52fef7847a00dd491baf
+  AFTER_COMMIT: 1e5d59f61a8ba5c01ef85615b517143bb4b72ff0
+  SOURCE: crates/sum_tree/src/sum_tree.rs
+jobs:
+  inserts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lld
+        # .cargo/config.toml links with lld on aarch64 Linux.
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: sudo apt-get update && sudo apt-get install -y lld
+      - name: Build both variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags --depth 1 origin "$BEFORE_COMMIT" "$AFTER_COMMIT"
+          git diff --exit-code --stat "$AFTER_COMMIT" HEAD -- crates Cargo.toml Cargo.lock
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          binaries="$RUNNER_TEMP/binaries"
+          mkdir -p "$binaries" crates/sum_tree/examples
+          cp bench/sum_tree_insert_bench/bench_edit.rs crates/sum_tree/examples/
+          build() {
+            cargo build --release -p sum_tree --example bench_edit 2>&1 | tee "$RUNNER_TEMP/build-$1.log"
+            grep -q 'Compiling sum_tree v' "$RUNNER_TEMP/build-$1.log"
+            cp "target/release/examples/bench_edit$suffix" "$binaries/$1$suffix"
+          }
+          build after
+          git show "$BEFORE_COMMIT:$SOURCE" > "$SOURCE"
+          build before
+          git checkout -- "$SOURCE"
+          if cmp -s "$binaries/before$suffix" "$binaries/after$suffix"; then
+            echo "the two binaries are identical" >&2
+            exit 1
+          fi
+          ls -l "$binaries"
+      - name: Measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          "$python" bench/sum_tree_insert_bench/measure_edit.py "$RUNNER_TEMP/binaries" "$GITHUB_STEP_SUMMARY" 7 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inserts-${{ matrix.os }}
+          path: results.tsv
+          if-no-files-found: ignore
+  scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            runs: zed=31 linux=31 firefox=15
+          - os: ubuntu-24.04-arm
+            runs: zed=31 linux=31 firefox=15
+          - os: macos-latest
+            runs: zed=51 linux=51 firefox=21
+          - os: windows-latest
+            runs: zed=21 linux=21 firefox=9
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: ./script/linux
+      - name: Build both variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags --depth 1 origin "$BEFORE_COMMIT" "$AFTER_COMMIT"
+          git diff --exit-code --stat "$AFTER_COMMIT" HEAD -- crates Cargo.toml Cargo.lock
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          binaries="$RUNNER_TEMP/binaries"
+          mkdir -p "$binaries"
+          build() {
+            cargo build --release -p worktree_benchmarks 2>&1 | tee "$RUNNER_TEMP/build-$1.log"
+            cp "target/release/worktree-benchmarks$suffix" "$binaries/$1$suffix"
+          }
+          build after
+          git show "$BEFORE_COMMIT:$SOURCE" > "$SOURCE"
+          build before
+          git checkout -- "$SOURCE"
+          grep -q 'Compiling sum_tree v' "$RUNNER_TEMP/build-before.log"
+          if cmp -s "$binaries/before$suffix" "$binaries/after$suffix"; then
+            echo "the two binaries are identical" >&2
+            exit 1
+          fi
+          ls -l "$binaries"
+      - name: Clone test trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.longpaths true
+          mkdir -p "$RUNNER_TEMP/trees"
+          cd "$RUNNER_TEMP/trees"
+          for url in https://github.com/zed-industries/zed https://github.com/torvalds/linux https://github.com/mozilla-firefox/firefox; do
+            name=$(basename "$url")
+            git clone --quiet --depth 1 --no-checkout "$url" "$name"
+            if [ "$RUNNER_OS" != Windows ]; then
+              git -C "$name" checkout --quiet HEAD -- .
+            elif ! git -C "$name" -c core.protectNTFS=false checkout --quiet HEAD -- . 2> "$RUNNER_TEMP/checkout-$name.log"; then
+              # Windows can't create some Linux paths, such as aux.c.
+              echo "$name: some paths could not be checked out:"
+              head -20 "$RUNNER_TEMP/checkout-$name.log"
+            fi
+            echo "$name: $(git -C "$name" rev-parse --short HEAD), $(git -C "$name" ls-files | wc -l) tracked files"
+          done
+          git --version
+          df -h .
+      - name: Measure
+        shell: bash
+        env:
+          RUNS: ${{ matrix.runs }}
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          trees=()
+          for runs in $RUNS; do
+            trees+=("$RUNNER_TEMP/trees/$runs")
+          done
+          "$python" bench/sum_tree_insert_bench/measure_scan.py "$RUNNER_TEMP/binaries" "$GITHUB_STEP_SUMMARY" before after -- "${trees[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-${{ matrix.os }}
+          path: results.tsv
+          if-no-files-found: ignore
