@@ -16,11 +16,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        # Run 44989148189 measured ubuntu-latest, macos-latest, and
+        # windows-latest. Its Linux arm64 job failed to link without lld.
+        os: [ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Install lld
+        # .cargo/config.toml links with lld on aarch64 Linux.
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: sudo apt-get update && sudo apt-get install -y lld
       - name: Build each variant
         shell: bash
         run: |
@@ -79,6 +85,8 @@ jobs:
           path: results.tsv
           if-no-files-found: ignore
   scan:
+    # Run 44989148189 measures these.
+    if: false
     strategy:
       fail-fast: false
       matrix:
