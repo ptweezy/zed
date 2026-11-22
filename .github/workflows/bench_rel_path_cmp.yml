@@ -1,0 +1,161 @@
+name: Measure RelPath::cmp
+on:
+  push:
+    branches:
+      - bench-relpath-cmp-xor
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  # main, and zed-industries/zed#67122 applied to it.
+  BEFORE_COMMIT: f4fe0be1f8c7974db07e01c5cd05bee0cf4eb8d9
+  AFTER_COMMIT: 2655ce4f2fc523e2f1473a8c75719ef7cacbac2a
+  SOURCE: crates/path/src/rel_path.rs
+jobs:
+  compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build each variant
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags --depth 1 origin "$BEFORE_COMMIT" "$AFTER_COMMIT"
+          git diff --exit-code --stat "$AFTER_COMMIT" HEAD -- crates Cargo.toml Cargo.lock
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          binaries="$RUNNER_TEMP/binaries"
+          mkdir -p "$binaries" crates/path/examples
+          cp bench/rel_path_cmp_bench/bench_rel_path_cmp.rs crates/path/examples/
+          build() {
+            cargo build --release -p path --example bench_rel_path_cmp 2>&1 | tee "$RUNNER_TEMP/build-$1.log"
+            grep -q 'Compiling path v' "$RUNNER_TEMP/build-$1.log"
+            cp "target/release/examples/bench_rel_path_cmp$suffix" "$binaries/$1$suffix"
+          }
+          build after
+          # The same comparison with 8-byte chunks.
+          git show "$AFTER_COMMIT:$SOURCE" | sed 's/u128/u64/g' > "$SOURCE"
+          test "$(grep -c u64 "$SOURCE")" = 2
+          build u64
+          git show "$BEFORE_COMMIT:$SOURCE" > "$SOURCE"
+          build before
+          git checkout -- "$SOURCE"
+          for pair in "before after" "before u64" "after u64"; do
+            set -- $pair
+            if cmp -s "$binaries/$1$suffix" "$binaries/$2$suffix"; then
+              echo "the $1 and $2 binaries are identical" >&2
+              exit 1
+            fi
+          done
+          ls -l "$binaries"
+      - name: List paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lists" "$RUNNER_TEMP/clones"
+          for url in https://github.com/zed-industries/zed https://github.com/torvalds/linux https://github.com/mozilla-firefox/firefox; do
+            name=$(basename "$url")
+            clone="$RUNNER_TEMP/clones/$name"
+            git clone --quiet --depth 1 --filter=blob:none --no-checkout "$url" "$clone"
+            git -C "$clone" -c core.quotePath=false ls-tree -r -t --name-only HEAD > "$RUNNER_TEMP/lists/$name.txt"
+            echo "$name: $(git -C "$clone" rev-parse --short HEAD), $(wc -l < "$RUNNER_TEMP/lists/$name.txt") paths"
+          done
+      - name: Measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          lists="$RUNNER_TEMP/lists"
+          "$python" bench/rel_path_cmp_bench/measure.py "$RUNNER_TEMP/binaries" "$GITHUB_STEP_SUMMARY" 5 before after u64 -- "$lists/zed.txt=31" "$lists/linux.txt=31" "$lists/firefox.txt=31"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compare-${{ matrix.os }}
+          path: results.tsv
+          if-no-files-found: ignore
+  scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            runs: zed=101 linux=101 firefox=41
+          - os: macos-latest
+            runs: zed=101 linux=101 firefox=41
+          - os: windows-latest
+            runs: zed=41 linux=41 firefox=15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: ./script/linux
+      - name: Build both variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags --depth 1 origin "$BEFORE_COMMIT" "$AFTER_COMMIT"
+          git diff --exit-code --stat "$AFTER_COMMIT" HEAD -- crates Cargo.toml Cargo.lock
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          binaries="$RUNNER_TEMP/binaries"
+          mkdir -p "$binaries"
+          build() {
+            cargo build --release -p worktree_benchmarks 2>&1 | tee "$RUNNER_TEMP/build-$1.log"
+            cp "target/release/worktree-benchmarks$suffix" "$binaries/$1$suffix"
+          }
+          build after
+          git show "$BEFORE_COMMIT:$SOURCE" > "$SOURCE"
+          build before
+          git checkout -- "$SOURCE"
+          grep -q 'Compiling path v' "$RUNNER_TEMP/build-before.log"
+          if cmp -s "$binaries/before$suffix" "$binaries/after$suffix"; then
+            echo "the two binaries are identical" >&2
+            exit 1
+          fi
+          ls -l "$binaries"
+      - name: Clone test trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.longpaths true
+          mkdir -p "$RUNNER_TEMP/trees"
+          cd "$RUNNER_TEMP/trees"
+          for url in https://github.com/zed-industries/zed https://github.com/torvalds/linux https://github.com/mozilla-firefox/firefox; do
+            name=$(basename "$url")
+            git clone --quiet --depth 1 --no-checkout "$url" "$name"
+            if [ "$RUNNER_OS" != Windows ]; then
+              git -C "$name" checkout --quiet HEAD -- .
+            elif ! git -C "$name" -c core.protectNTFS=false checkout --quiet HEAD -- . 2> "$RUNNER_TEMP/checkout-$name.log"; then
+              # Windows can't create some Linux paths, such as aux.c.
+              echo "$name: some paths could not be checked out:"
+              head -20 "$RUNNER_TEMP/checkout-$name.log"
+            fi
+            echo "$name: $(git -C "$name" rev-parse --short HEAD), $(git -C "$name" ls-files | wc -l) tracked files"
+          done
+          git --version
+          df -h .
+      - name: Measure
+        shell: bash
+        env:
+          RUNS: ${{ matrix.runs }}
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          trees=()
+          for runs in $RUNS; do
+            trees+=("$RUNNER_TEMP/trees/$runs")
+          done
+          "$python" bench/rel_path_cmp_bench/measure_scan.py "$RUNNER_TEMP/binaries" "$GITHUB_STEP_SUMMARY" before after -- "${trees[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-${{ matrix.os }}
+          path: results.tsv
+          if-no-files-found: ignore
