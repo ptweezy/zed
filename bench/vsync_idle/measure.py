@@ -24,15 +24,16 @@ Other scenarios:
   typing       10 keystrokes per second into a short text file
   wheel        80 mouse wheel notches per second over a long file, which redraws on every vblank
   latency      the time from a key press to the frame it causes, in a short text file with
-               the cursor not blinking, for 40 presses 0.3 s apart. Reported to the end of the
-               frame (when Zed logs it) and to its start (minus the logged frame duration).
+               the cursor not blinking, for 40 presses 0.3 to 0.4 s apart. Reported to the end of
+               the frame (when Zed logs it) and to its start (minus the logged frame duration).
+               The spacing is random so that presses don't land on one phase of the refresh cycle.
                The key stays down until the frame is logged: GPUI draws without logging when
                another key event, such as the release, finds the window dirty.
 
 Before the scenarios, one probe run per build checks that Zed still draws frames after
 launch, typing, a restore from minimized, and a resize, and saves a screenshot of each.
 """
-import ctypes, json, os, re, shutil, statistics, subprocess, sys, threading, time
+import ctypes, json, os, random, re, shutil, statistics, subprocess, sys, threading, time
 from ctypes import wintypes
 
 import psutil
@@ -465,7 +466,7 @@ def run_latency(variant, shot=None, presses=40, gap=0.3):
         ends, starts = [], []
         with open(zed.stderr_path, "rb") as log:
             for _ in range(presses):
-                time.sleep(gap)
+                time.sleep(gap + random.uniform(0, 0.1))
                 log.read()
                 logged = b""
                 start = time.perf_counter()
