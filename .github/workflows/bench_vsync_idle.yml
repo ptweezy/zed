@@ -1,0 +1,72 @@
+name: bench_vsync_idle
+# Builds Zed twice on a Windows runner, with and without the demand-driven vsync thread,
+# and measures both with bench/vsync_idle/measure.py. Not for upstream.
+on:
+  push:
+    branches: [bench-windows-vsync-demand]
+    paths-ignore:
+      - "bench/vsync_idle/**"
+      - ".github/workflows/bench_vsync_idle_measure.yml"
+permissions:
+  contents: read
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 340
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      # The commit before the change. Only crates/gpui_windows differs.
+      BEFORE_SHA: 24d37721115bd410b8f73998f8da5c4598b64a03
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Use C drive for the target dir
+        run: echo "CARGO_TARGET_DIR=C:\\zed-target" >> "$GITHUB_ENV"
+      - name: System info
+        run: |
+          powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfLogicalProcessors; Get-CimInstance Win32_VideoController | Format-List Name,CurrentRefreshRate,CurrentHorizontalResolution,CurrentVerticalResolution; Get-PSDrive -PSProvider FileSystem"
+          df -h . || true
+      - name: Build after
+        run: |
+          cargo build --release -p zed
+          mkdir -p /c/zed-bin/after
+          cp "$CARGO_TARGET_DIR/release/zed.exe" /c/zed-bin/after/
+      - name: Build before
+        run: |
+          git fetch --depth=1 origin "$BEFORE_SHA"
+          git checkout FETCH_HEAD -- crates/gpui_windows
+          git status --short
+          cargo build --release -p zed
+          mkdir -p /c/zed-bin/before
+          cp "$CARGO_TARGET_DIR/release/zed.exe" /c/zed-bin/before/
+          git checkout HEAD -- crates/gpui_windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zed-binaries
+          path: C:\zed-bin
+          compression-level: 1
+      - name: Measure
+        run: |
+          # Pick up harness fixes pushed while the build ran.
+          git fetch --depth=1 origin bench-windows-vsync-demand
+          git checkout FETCH_HEAD -- bench/vsync_idle
+          python -m pip install psutil
+          python bench/vsync_idle/measure.py $(cat bench/vsync_idle/args) | tee results.md
+          tail -24 results.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: |
+            results.md
+            bench-work/results
+            bench-work/runs/*/stderr.log
+      - name: Unit tests
+        run: cargo test --release -p gpui_windows --lib vsync

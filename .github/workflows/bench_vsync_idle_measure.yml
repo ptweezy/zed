@@ -1,0 +1,46 @@
+name: bench_vsync_idle_measure
+# Reruns bench/vsync_idle/measure.py with the binaries of an earlier bench_vsync_idle run,
+# named in bench/vsync_idle/binaries_run_id. Does nothing while that file is empty.
+on:
+  push:
+    branches: [bench-windows-vsync-demand]
+    paths:
+      - "bench/vsync_idle/**"
+permissions:
+  actions: read
+  contents: read
+jobs:
+  measure:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - id: binaries
+        run: echo "run_id=$(tr -d '[:space:]' < bench/vsync_idle/binaries_run_id)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        if: steps.binaries.outputs.run_id != ''
+        with:
+          python-version: "3.12"
+      - name: Download binaries
+        if: steps.binaries.outputs.run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "${{ steps.binaries.outputs.run_id }}" --repo "$GITHUB_REPOSITORY" -n zed-binaries -D /c/zed-bin
+      - name: Measure
+        if: steps.binaries.outputs.run_id != ''
+        run: |
+          powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | Format-List Name,CurrentRefreshRate,CurrentHorizontalResolution,CurrentVerticalResolution"
+          python -m pip install psutil
+          python bench/vsync_idle/measure.py $(cat bench/vsync_idle/args) | tee results.md
+          tail -24 results.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.binaries.outputs.run_id != ''
+        with:
+          name: bench-results
+          path: |
+            results.md
+            bench-work/results
+            bench-work/runs/*/stderr.log
