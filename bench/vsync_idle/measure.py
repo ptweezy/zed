@@ -24,7 +24,8 @@ Other scenarios:
   typing       10 keystrokes per second into a short text file
   wheel        80 mouse wheel notches per second over a long file, which redraws on every vblank
   latency      the time from a key press to the frame it causes, in a short text file with
-               the cursor not blinking, for 40 presses 0.3 s apart
+               the cursor not blinking, for 40 presses 0.3 s apart. Reported to the end of the
+               frame (when Zed logs it) and to its start (minus the logged frame duration).
 
 Before the scenarios, one probe run per build checks that Zed still draws frames after
 launch, typing, a restore from minimized, and a resize, and saves a screenshot of each.
@@ -48,6 +49,8 @@ WINDOW = float(os.environ.get("BENCH_WINDOW", 10))
 IDLE_WINDOW = float(os.environ.get("BENCH_IDLE_WINDOW", 20))
 VARIANTS = ["before", "after"]
 FRAME = re.compile(r"^frame duration: ", re.M)
+FRAME_DURATION = re.compile(rb"frame duration: ([\d.]+)(ns|\xc2\xb5s|ms|s)\r?\n")
+UNIT_MS = {b"ns": 1e-6, b"\xc2\xb5s": 1e-3, b"ms": 1.0, b"s": 1e3}
 SETTINGS = {
     "telemetry": {"diagnostics": False, "metrics": False},
     "auto_update": False,
@@ -457,30 +460,37 @@ def run_latency(variant, shot=None, presses=40, gap=0.3):
     with Zed(variant, "latency", file=SHORT_FILE, cursor_blink=False) as zed:
         focused = foreground(zed.hwnd)
         time.sleep(SETTLE)
-        samples = []
+        ends, starts = [], []
         with open(zed.stderr_path, "rb") as log:
             for _ in range(presses):
                 time.sleep(gap)
                 log.read()
+                logged = b""
                 start = time.perf_counter()
                 press(VK_J)
-                while time.perf_counter() - start < 1:
-                    if b"frame duration" in log.read():
-                        samples.append((time.perf_counter() - start) * 1e3)
+                # Spin instead of sleeping: a sleep can round up to a 15.6 ms timer tick.
+                while (now := time.perf_counter()) - start < 1:
+                    logged += log.read()
+                    if frame := FRAME_DURATION.search(logged):
+                        end = (now - start) * 1e3
+                        ends.append(end)
+                        starts.append(end - float(frame[1]) * UNIT_MS[frame[2]])
                         break
-                    time.sleep(0.0005)
         if shot:
             screenshot(shot)
-    if not samples:
+    if not ends:
         raise RuntimeError("no frame followed a key press")
-    samples.sort()
-    return {
-        "latency": statistics.median(samples),
-        "latency_p90": samples[int(len(samples) * 0.9)],
-        "latency_max": samples[-1],
-        "answered": len(samples),
-        "foreground": focused,
-    }
+
+    def spread(samples, name):
+        samples = sorted(samples)
+        return {
+            name: statistics.median(samples),
+            f"{name}_p90": samples[int(len(samples) * 0.9)],
+            f"{name}_max": samples[-1],
+            f"{name}_samples": [round(sample, 1) for sample in samples],
+        }
+
+    return {**spread(ends, "latency"), **spread(starts, "start"), "answered": len(ends), "foreground": focused}
 
 
 def probe(variant):
@@ -528,8 +538,10 @@ def summarize(rows, runs):
                      ("dwm CPU ms/s", "dwm")])
     if latency:
         print()
-        print(f"Key press to drawn frame in ms, per run of 40 presses; medians of {runs} runs per build")
-        table(latency, [("Median", "latency"), ("90th percentile", "latency_p90"), ("Slowest", "latency_max")])
+        print(f"Key press to frame in ms, per run of 40 presses; medians of {runs} runs per build")
+        table(latency, [("Frame start, median", "start"), ("90th percentile", "start_p90"), ("Slowest", "start_max"),
+                        ("Frame end, median", "latency"), ("90th percentile", "latency_p90"),
+                        ("Slowest", "latency_max")])
     print(f"Cells: {' → '.join(VARIANTS)}")
     for scenario, results in rows:
         print()
