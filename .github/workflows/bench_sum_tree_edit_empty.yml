@@ -1,0 +1,71 @@
+name: Measure edits of an empty SumTree
+on:
+  push:
+    branches:
+      - bench-sum-tree-edit-empty-tree
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  # main before zed-industries/zed#67332, main with it, and the commit that
+  # slices an empty tree again.
+  OLD_COMMIT: ac22c37e8619a5b48e1b0b60822c63534c974cd0
+  MAIN_COMMIT: 1a391ced25745cbc82de8169eddb0e5b36a83935
+  GUARD_COMMIT: 1ecfa4cd3d0a8b53a579db322d9f5f027dc12c1c
+  SOURCE: crates/sum_tree/src/sum_tree.rs
+jobs:
+  inserts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lld
+        # .cargo/config.toml links with lld on aarch64 Linux.
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: sudo apt-get update && sudo apt-get install -y lld
+      - name: Build each variant
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags --depth 1 origin "$OLD_COMMIT" "$MAIN_COMMIT" "$GUARD_COMMIT"
+          git diff --exit-code --stat "$GUARD_COMMIT" HEAD -- crates Cargo.toml Cargo.lock
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          binaries="$RUNNER_TEMP/binaries"
+          mkdir -p "$binaries" crates/sum_tree/examples
+          cp bench/sum_tree_insert_bench/bench_edit.rs crates/sum_tree/examples/
+          build() {
+            cargo build --release -p sum_tree --example bench_edit 2>&1 | tee "$RUNNER_TEMP/build-$1.log"
+            grep -q 'Compiling sum_tree v' "$RUNNER_TEMP/build-$1.log"
+            cp "target/release/examples/bench_edit$suffix" "$binaries/$1$suffix"
+          }
+          build guard
+          git show "$MAIN_COMMIT:$SOURCE" > "$SOURCE"
+          build main
+          git show "$OLD_COMMIT:$SOURCE" > "$SOURCE"
+          build old
+          git checkout -- "$SOURCE"
+          for pair in "old main" "old guard" "main guard"; do
+            set -- $pair
+            if cmp -s "$binaries/$1$suffix" "$binaries/$2$suffix"; then
+              echo "the $1 and $2 binaries are identical" >&2
+              exit 1
+            fi
+          done
+          ls -l "$binaries"
+      - name: Measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          "$python" bench/sum_tree_insert_bench/measure_edit_isolated.py "$RUNNER_TEMP/binaries" "$GITHUB_STEP_SUMMARY" 5 3 old main guard
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inserts-${{ matrix.os }}
+          path: results.tsv
+          if-no-files-found: ignore
