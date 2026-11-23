@@ -29,7 +29,8 @@ Other work on the machine changes Zed's own CPU time: a build on ten other
 cores raised it by about 30%, and another app rendering on the same GPU lowered
 it by 10% or more. Each run records the CPU time of everything else ("other").
 With BENCH_MAX_OTHER (ms/s) set, a run starts only once the machine has been
-below that for three seconds, and is repeated if it rose above it.
+below that for three seconds, and is repeated if it rose above it. After 30
+repeats the harness exits, so a run above the limit is never recorded.
 """
 import json, os, re, shutil, signal, statistics, subprocess, sys, time
 
@@ -230,6 +231,18 @@ def wait_for_quiet():
             announced = True
 
 
+def quiet_run(label, run):
+    """Returns the result of `run()` from a quiet machine, or exits."""
+    for _ in range(30):
+        wait_for_quiet()
+        result = run()
+        if not MAX_OTHER or result["other"] <= MAX_OTHER:
+            return result
+        print(f"busy machine, repeating {label}: zed {result['zed']:.1f}, other {result['other']:.0f} ms/s",
+              flush=True)
+    sys.exit(f"{label}: everything else stayed above {MAX_OTHER:.0f} ms/s for 30 runs")
+
+
 def snapshot(pid, shell_pid, stderr_path):
     return {
         "time": time.monotonic(),
@@ -350,19 +363,14 @@ def main():
                             shot = None
                             if index == 0:
                                 shot = os.path.join(WORK, "results", f"{stamp}-{hz}-{scenario}-{variant}.png")
-                            wait_for_quiet()
-                            try:
-                                result = run_once(scenario, variant, shell_pid, shot)
-                            except RuntimeError as error:
-                                print(f"retrying {hz} {scenario} {variant}: {error}", flush=True)
-                                result = run_once(scenario, variant, shell_pid, shot)
-                            for _ in range(30):
-                                if not MAX_OTHER or result["other"] <= MAX_OTHER:
-                                    break
-                                print(f"busy machine, repeating {hz} {scenario} {variant}: "
-                                      f"zed {result['zed']:.1f}, other {result['other']:.0f} ms/s", flush=True)
-                                wait_for_quiet()
-                                result = run_once(scenario, variant, shell_pid, shot)
+                            def run():
+                                try:
+                                    return run_once(scenario, variant, shell_pid, shot)
+                                except RuntimeError as error:
+                                    print(f"retrying {hz} {scenario} {variant}: {error}", flush=True)
+                                    return run_once(scenario, variant, shell_pid, shot)
+
+                            result = quiet_run(f"{hz} {scenario} {variant}", run)
                             results[variant].append(result)
                             record = dict(hz=hz, scenario=scenario, variant=variant, index=index, **result)
                             raw.write(json.dumps(record) + "\n")
