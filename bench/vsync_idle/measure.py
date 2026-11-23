@@ -21,6 +21,8 @@ Scenarios:
   two-windows  a second window is open and has the foreground; the first one is minimized
   typing       10 keystrokes per second
   scrolling    120 Down-arrow presses per second
+  latency      the time from a key press to the frame it causes, with the cursor not
+               blinking, for 40 presses 0.3 s apart
 
 Before the scenarios, one probe run per build checks that Zed still draws frames after
 launch, typing, a restore from minimized, and a resize, and saves a screenshot of each.
@@ -225,13 +227,13 @@ def kill_tree(pid):
 class Zed:
     """A running Zed with a fresh user data dir, killed on exit."""
 
-    def __init__(self, variant, name):
+    def __init__(self, variant, name, **settings):
         self.dir = os.path.join(WORK, "runs", f"{name}-{variant}")
         shutil.rmtree(self.dir, ignore_errors=True)
         data = os.path.join(self.dir, "data")
         os.makedirs(os.path.join(data, "config"), exist_ok=True)
         with open(os.path.join(data, "config", "settings.json"), "w") as file:
-            json.dump(SETTINGS, file)
+            json.dump({**SETTINGS, **settings}, file)
         self.stderr_path = os.path.join(self.dir, "stderr.log")
         env = dict(os.environ, ZED_MEASUREMENTS="1")
         with open(self.stderr_path, "w") as stderr, open(os.path.join(self.dir, "stdout.log"), "w") as stdout:
@@ -381,6 +383,37 @@ def run_once(scenario, variant, compositor, shot=None):
     }
 
 
+def run_latency(variant, shot=None, presses=40, gap=0.3):
+    """Times each key press until Zed logs the frame it caused, in milliseconds."""
+    with Zed(variant, "latency", cursor_blink=False) as zed:
+        focused = foreground(zed.hwnd)
+        time.sleep(SETTLE)
+        samples = []
+        with open(zed.stderr_path, "rb") as log:
+            for _ in range(presses):
+                time.sleep(gap)
+                log.read()
+                start = time.perf_counter()
+                press(VK_J)
+                while time.perf_counter() - start < 1:
+                    if b"frame duration" in log.read():
+                        samples.append((time.perf_counter() - start) * 1e3)
+                        break
+                    time.sleep(0.0005)
+        if shot:
+            screenshot(shot)
+    if not samples:
+        raise RuntimeError("no frame followed a key press")
+    samples.sort()
+    return {
+        "latency": statistics.median(samples),
+        "latency_p90": samples[int(len(samples) * 0.9)],
+        "latency_max": samples[-1],
+        "answered": len(samples),
+        "foreground": focused,
+    }
+
+
 def probe(variant):
     """Checks that frames are still drawn after each kind of event that used to rely on a
     paint at every vblank. Returns {check: frames drawn}."""
@@ -415,11 +448,22 @@ def probe(variant):
 
 
 def summarize(rows, runs):
-    columns = [("Frames/s", "fps"), ("Zed CPU ms/s", "zed"), ("Switches/s", "switches"),
-               ("UI thread switches/s", "ui_switches"), ("Vsync thread switches/s", "vsync_switches"),
-               ("dwm CPU ms/s", "dwm")]
-    print()
-    print(f"Medians of {runs} runs per build, rotating order; {WINDOW:.0f} s windows")
+    latency = [row for row in rows if row[0] == "latency"]
+    rows = [row for row in rows if row[0] != "latency"]
+    if rows:
+        print()
+        print(f"Medians of {runs} runs per build, rotating order; {WINDOW:.0f} s windows")
+        table(rows, [("Frames/s", "fps"), ("Zed CPU ms/s", "zed"), ("Switches/s", "switches"),
+                     ("UI thread switches/s", "ui_switches"), ("Vsync thread switches/s", "vsync_switches"),
+                     ("dwm CPU ms/s", "dwm")])
+    if latency:
+        print()
+        print(f"Key press to drawn frame in ms, per run of 40 presses; medians of {runs} runs per build")
+        table(latency, [("Median", "latency"), ("90th percentile", "latency_p90"), ("Slowest", "latency_max")])
+    print(f"Cells: {' → '.join(VARIANTS)}")
+
+
+def table(rows, columns):
     print("| Scenario | " + " | ".join(title for title, _ in columns) + " |")
     print("|---|" + "---|" * len(columns))
     for scenario, results in rows:
@@ -435,7 +479,6 @@ def summarize(rows, runs):
             return f"{before:.1f} → {after:.1f}{change}"
 
         print(f"| {scenario} | " + " | ".join(cell(key) for _, key in columns) + " |")
-    print(f"Cells: {' → '.join(VARIANTS)}")
 
 
 def main():
@@ -470,12 +513,17 @@ def main():
             shift = index % len(VARIANTS)
             for variant in VARIANTS[shift:] + VARIANTS[:shift]:
                 shot = os.path.join(RESULTS, f"{scenario}-{variant}.png") if index == 0 else None
+                def run():
+                    if scenario == "latency":
+                        return run_latency(variant, shot)
+                    return run_once(scenario, variant, compositor, shot)
+
                 try:
-                    result = run_once(scenario, variant, compositor, shot)
+                    result = run()
                 except Exception as error:
                     print(f"retrying {scenario} {variant}: {error!r}", flush=True)
                     try:
-                        result = run_once(scenario, variant, compositor, shot)
+                        result = run()
                     except Exception as error:
                         print(f"skipping {scenario} {variant}: {error!r}", flush=True)
                         continue
