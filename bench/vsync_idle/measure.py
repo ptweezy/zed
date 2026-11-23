@@ -26,6 +26,8 @@ Other scenarios:
   latency      the time from a key press to the frame it causes, in a short text file with
                the cursor not blinking, for 40 presses 0.3 s apart. Reported to the end of the
                frame (when Zed logs it) and to its start (minus the logged frame duration).
+               The key stays down until the frame is logged: GPUI draws without logging when
+               another key event, such as the release, finds the window dirty.
 
 Before the scenarios, one probe run per build checks that Zed still draws frames after
 launch, typing, a restore from minimized, and a resize, and saves a screenshot of each.
@@ -467,7 +469,7 @@ def run_latency(variant, shot=None, presses=40, gap=0.3):
                 log.read()
                 logged = b""
                 start = time.perf_counter()
-                press(VK_J)
+                user32.keybd_event(VK_J, 0, 0, 0)
                 # Spin instead of sleeping: a sleep can round up to a 15.6 ms timer tick.
                 while (now := time.perf_counter()) - start < 1:
                     logged += log.read()
@@ -476,6 +478,7 @@ def run_latency(variant, shot=None, presses=40, gap=0.3):
                         ends.append(end)
                         starts.append(end - float(frame[1]) * UNIT_MS[frame[2]])
                         break
+                user32.keybd_event(VK_J, 0, KEYEVENTF_KEYUP, 0)
         if shot:
             screenshot(shot)
     if not ends:
