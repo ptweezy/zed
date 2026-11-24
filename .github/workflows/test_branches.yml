@@ -1,0 +1,25 @@
+name: Test branch listing
+on:
+  push:
+    branches:
+      - test-branches-head-tracking
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: ./script/linux
+      - name: Test
+        shell: bash
+        run: |
+          git --version
+          cargo test -p git --lib
