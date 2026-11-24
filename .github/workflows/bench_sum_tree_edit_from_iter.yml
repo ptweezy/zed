@@ -1,0 +1,66 @@
+name: Measure edits of an empty SumTree built with from_iter
+on:
+  push:
+    branches:
+      - bench-sum-tree-edit-from-iter
+permissions:
+  contents: read
+jobs:
+  edits:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lld
+        # .cargo/config.toml links with lld on aarch64 Linux.
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: sudo apt-get update && sudo apt-get install -y lld
+      - name: Describe the machine
+        shell: bash
+        run: |
+          uname -a
+          sysctl -n machdep.cpu.brand_string 2>/dev/null || lscpu 2>/dev/null | head -20 || true
+      - name: Build each variant
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          binaries="$RUNNER_TEMP/binaries"
+          source=crates/sum_tree/src/sum_tree.rs
+          mkdir -p "$binaries" crates/sum_tree/examples
+          cp bench/sum_tree_edit_bench/bench_edit_empty.rs crates/sum_tree/examples/
+          build() {
+            cargo build --release -p sum_tree --example bench_edit_empty 2>&1 | tee "$RUNNER_TEMP/build-$1.log"
+            grep -q 'Compiling sum_tree v' "$RUNNER_TEMP/build-$1.log"
+            cp "target/release/examples/bench_edit_empty$suffix" "$binaries/$1$suffix"
+          }
+          # `pr` is this branch's own sum_tree.rs: the commit proposed for the pull request.
+          build pr
+          for variant in old main guard suggestion checks-slice nochecks-inplace; do
+            cp "bench/sum_tree_edit_bench/variants/$variant.rs" "$source"
+            build "$variant"
+          done
+          git checkout -- "$source"
+          ls -l "$binaries"
+          distinct=$(cd "$binaries" && cksum ./* | awk '{print $1}' | sort -u | wc -l)
+          if [ "$distinct" -ne 7 ]; then
+            echo "some variant binaries are identical" >&2
+            exit 1
+          fi
+      - name: Measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          "$python" bench/sum_tree_edit_bench/measure_edit_empty.py "$RUNNER_TEMP/binaries" "$GITHUB_STEP_SUMMARY" 9 none old main guard suggestion pr checks-slice@1M nochecks-inplace@1M
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: edits-${{ matrix.os }}
+          path: results.tsv
+          if-no-files-found: ignore
