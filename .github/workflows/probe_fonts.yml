@@ -1,0 +1,22 @@
+name: Probe runner fonts
+
+on:
+  push:
+    branches: [bench-probe-counters]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Noto Sans Mono packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-mono > /dev/null
+          echo "after fonts-noto-mono:"; fc-list | grep -i 'Noto Sans Mono' || echo "  none"
+          dpkg -L fonts-noto-mono | grep -i '\.ttf' || true
+          sudo apt-get install -y -qq fonts-noto-core > /dev/null
+          echo "after fonts-noto-core:"; fc-list | grep -i 'Noto Sans Mono' || echo "  none"
+          fc-match 'Noto Sans Mono'
