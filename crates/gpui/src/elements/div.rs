@@ -2164,6 +2164,7 @@ impl Element for Div {
         window: &mut Window,
         cx: &mut App,
     ) {
+        std::hint::black_box(vec![0u8; 64]);
         let image_cache = self
             .image_cache
             .as_mut()
