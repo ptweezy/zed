@@ -1,0 +1,59 @@
+name: GPUI benchmark report validation
+
+on:
+  push:
+    branches: [bench-gpui-report-validate]
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: compare (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One extra 64-byte allocation per Div paint.
+          - name: injected-allocation
+            baseline: HEAD~2
+            candidate: HEAD~1
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+      - name: Install dependencies
+        run: |
+          ./script/linux
+          sudo apt-get install -y lld mesa-vulkan-drivers fonts-noto-mono
+          sudo sysctl -w kernel.perf_event_paranoid=1
+          lscpu | grep 'Model name'
+      - name: Compare benchmarks
+        env:
+          BASELINE: ${{ matrix.baseline }}
+          CANDIDATE: ${{ matrix.candidate }}
+        run: |
+          baseline=$(git rev-parse --verify "$BASELINE^{commit}")
+          candidate=$(git rev-parse --verify "$CANDIDATE^{commit}")
+          script/gpui-bench-compare "$baseline" "$candidate" \
+            --measurement auto --exclude '^(Randomized|Cached)Tree/mixed/' --build-timeout 5400 --markdown "$RUNNER_TEMP/gpui-benchmarks.md"
+      - name: Publish report
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f "$RUNNER_TEMP/gpui-benchmarks.md" ]; then
+            cat "$RUNNER_TEMP/gpui-benchmarks.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: gpui-benchmarks-${{ matrix.name }}
+          path: |
+            target/gpui-bench-compare/runs/
+            target/gpui-bench-compare/binaries/*/*.log
+          if-no-files-found: ignore
+          retention-days: 30
