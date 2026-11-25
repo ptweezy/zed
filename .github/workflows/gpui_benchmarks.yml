@@ -1,0 +1,85 @@
+name: GPUI benchmark report
+
+# Report-only: compares the GPUI benchmarks of two revisions on one runner and
+# writes the result to the job summary. Regressions never fail the job.
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Baseline commit, or origin/<branch>
+        required: true
+        type: string
+      candidate:
+        description: Candidate commit, or origin/<branch> (default is the dispatched ref)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpui-benchmarks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'benchmark') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'benchmark'))
+    # Hosted arm64 runners expose instruction counters; x86_64 ones do only on some CPUs.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          # A pull request checks out its merge commit, whose first parent is the base branch.
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+          persist-credentials: false
+      - name: Install dependencies
+        run: |
+          ./script/linux
+          # .cargo/config.toml links with lld on aarch64 Linux. Hosted runners have no GPU, so
+          # the headless renderer uses Mesa's software Vulkan driver. The text benchmarks
+          # require Noto Sans Mono.
+          sudo apt-get install -y lld mesa-vulkan-drivers fonts-noto-mono
+          # Retired-instruction counters need perf access, which hosted runners deny by default.
+          sudo sysctl -w kernel.perf_event_paranoid=1
+      - name: Compare benchmarks
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BASELINE: ${{ inputs.baseline }}
+          INPUT_CANDIDATE: ${{ inputs.candidate }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            baseline=$(git rev-parse HEAD^1)
+            candidate=$(git rev-parse HEAD)
+          else
+            baseline=$(git rev-parse --verify "$INPUT_BASELINE^{commit}")
+            candidate=$(git rev-parse --verify "${INPUT_CANDIDATE:-HEAD}^{commit}")
+          fi
+          # The mixed workloads spend about three minutes per process in Mesa's software
+          # rasterizer, which was 80% of the measuring time on a hosted runner.
+          script/gpui-bench-compare "$baseline" "$candidate" \
+            --measurement auto --exclude '^(Randomized|Cached)Tree/mixed/' \
+            --build-timeout 5400 --markdown "$RUNNER_TEMP/gpui-benchmarks.md"
+      - name: Publish report
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f "$RUNNER_TEMP/gpui-benchmarks.md" ]; then
+            cat "$RUNNER_TEMP/gpui-benchmarks.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: gpui-benchmarks
+          path: |
+            target/gpui-bench-compare/runs/
+            target/gpui-bench-compare/binaries/*/*.log
+          if-no-files-found: ignore
+          retention-days: 30

@@ -3,6 +3,7 @@
 
 Usage: script/gpui-bench-compare BASELINE CANDIDATE
        script/gpui-bench-compare BASELINE CANDIDATE --filter 'TextPanels/'
+       script/gpui-bench-compare BASELINE CANDIDATE --markdown report.md
 
 The invoking checkout's three benchmark files, randomized tree fixture and bench
 macro are used for BOTH revisions, so both revisions must provide the GPUI
@@ -19,8 +20,13 @@ benchmarks' own Criterion settings (including inspector's five-second
 measurement). --repetitions controls independent runs, not random seeds. Use
 --seed to compare another fixed tree.
 
-Foreground retired instructions are primary. Linux needs perf access
-(CAP_PERFMON or perf_event_paranoid <= 2); macOS needs Apple Silicon. Frames run
+Foreground retired instructions are primary by default. Linux needs perf access
+(CAP_PERFMON or perf_event_paranoid <= 2); macOS needs Apple Silicon. Without it,
+--measurement foreground-allocations counts the benchmark thread's heap
+allocations instead, and --measurement auto picks instructions when the machine
+can count them. Some hosted x86_64 runners (AMD EPYC) expose no instruction
+counter at all. --markdown writes a report that flags each change larger
+than 1% and twice the run-to-run spread of either side. Frames run
 the production pipeline through the platform's headless GPU renderer, so they
 include scene encoding and GPU submission; GPU execution itself runs on other
 threads and isn't counted. Wall-time medians include calibration samples; raw
@@ -35,6 +41,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -83,6 +90,8 @@ FAST = [
     "--sample-size", "10",
     "--nresamples", "1000",
 ]
+FLAG_PERCENT = 1.0
+FLAG_NOISE_MULTIPLE = 2.0
 
 
 def run(command, *, cwd, environment, log, timeout):
@@ -112,7 +121,7 @@ def git(root, *arguments):
     return subprocess.check_output(["git", "-C", str(root), *arguments], text=True).strip()
 
 
-def prepare(root, cache, revision, features, timeout, environment):
+def prepare(root, cache, revision, features, timeout, build_timeout, environment):
     commit = git(root, "rev-parse", "--verify", f"{revision}^{{commit}}")
     source = cache / "sources" / commit
     source.mkdir(parents=True, exist_ok=True)
@@ -144,7 +153,7 @@ def prepare(root, cache, revision, features, timeout, environment):
     run(
         ["cargo", "tree", "--locked", "-p", "gpui_platform", "--features", features,
          "-e", "normal,build,dev,features"],
-        cwd=source, environment=environment, log=feature_log, timeout=timeout,
+        cwd=source, environment=environment, log=feature_log, timeout=build_timeout,
     )
     if 'feature "test-support"' in feature_log.read_text():
         raise RuntimeError(f"benchmark graph enables test-support: {feature_log}")
@@ -155,7 +164,7 @@ def prepare(root, cache, revision, features, timeout, environment):
     for target in TARGETS:
         command += ["--bench", target]
     elapsed = run(command, cwd=source, environment=environment,
-                  log=artifacts / "build.log", timeout=timeout)
+                  log=artifacts / "build.log", timeout=build_timeout)
     binaries = {}
     for line in (artifacts / "build.log").read_text().splitlines():
         try:
@@ -197,6 +206,24 @@ def verify_distinct_artifacts(revisions):
                 )
 
 
+def resolve_measurement(binary, directory, environment, timeout):
+    log = directory / "measurement-probe.log"
+    try:
+        # Benchmarks select their measurement before filtering, so an empty listing probes it.
+        run([str(binary), "--list", "^$"], cwd=directory,
+            environment=dict(environment, BENCH_MEASUREMENT="foreground-instructions"),
+            log=log, timeout=timeout)
+    except RuntimeError:
+        if "failed to select benchmark measurement" not in log.read_text():
+            raise
+        return "foreground-allocations"
+    return "foreground-instructions"
+
+
+class ZeroMeasurement(RuntimeError):
+    pass
+
+
 def measure(binary, identifier, directory, environment, timeout, slow):
     directory.mkdir(parents=True, exist_ok=True)
     environment = dict(environment, CRITERION_HOME=str(directory / "criterion"))
@@ -207,26 +234,117 @@ def measure(binary, identifier, directory, environment, timeout, slow):
                   log=directory / "run.log", timeout=timeout)
     samples = list((directory / "criterion").glob("**/new/sample.json"))
     if len(samples) != 1:
+        # A case that never allocates on the measured thread has zero-valued samples.
+        if "took zero time per iteration" in (directory / "run.log").read_text():
+            raise ZeroMeasurement(f"Criterion can't analyze a zero measurement; see {directory}")
         raise RuntimeError(f"expected one measured case, got {len(samples)}: {directory}")
     sample = json.loads(samples[0].read_text())
     counts = [total / count for total, count in zip(sample["times"], sample["iters"])]
-    wall = re.search(
-        r"wall time per iteration: median ([\d.]+) (\S+) \(min ([\d.]+), max ([\d.]+)",
-        (directory / "run.log").read_text(),
+    # MetricReport prints "<indent><metric> per iteration: median <value> [K|M|G ]<unit> (min ...",
+    # where the indent is either whitespace or the benchmark ID.
+    secondary = re.compile(
+        "^(?:" + re.escape(identifier) + r"|\s*)(.+?) per iteration: median ([\d.]+) "
+        r"(?:([KMG]) )?(.+?) \(min",
+        re.MULTILINE,
     )
-    if wall is None:
+    scales = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1, "K": 1e3, "M": 1e6, "G": 1e9}
+    secondaries = {}
+    for name, value, prefix, unit in secondary.findall((directory / "run.log").read_text()):
+        secondaries.setdefault(name, float(value) * scales.get(prefix or unit, 1))
+    if "wall time" not in secondaries:
         raise RuntimeError(f"missing wall-time secondary: {directory / 'run.log'}")
-    units = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1}
     return {
-        "instructions": statistics.median(counts),
+        "primary": statistics.median(counts),
         "sample_min": min(counts), "sample_max": max(counts),
-        "wall_seconds": float(wall[1]) * units[wall[2]],
+        "secondaries": secondaries,
         "elapsed_seconds": elapsed, "iterations": sum(sample["iters"]),
     }
 
 
 def spread(values):
-    return (max(values) - min(values)) / statistics.median(values) * 100
+    middle = statistics.median(values)
+    if middle == 0:
+        return math.inf if max(values) > min(values) else 0.0
+    return (max(values) - min(values)) / middle * 100
+
+
+def change(baseline_runs, candidate_runs):
+    baseline, candidate = statistics.median(baseline_runs), statistics.median(candidate_runs)
+    if baseline == 0:
+        return math.inf if candidate > 0 else 0.0
+    return (candidate / baseline - 1) * 100
+
+
+def verdict(baseline_runs, candidate_runs):
+    noise = max(spread(baseline_runs), spread(candidate_runs)) if len(baseline_runs) > 1 else 0.0
+    percent = change(baseline_runs, candidate_runs)
+    if abs(percent) <= max(FLAG_PERCENT, FLAG_NOISE_MULTIPLE * noise):
+        return ""
+    return "regression" if percent > 0 else "improvement"
+
+
+def write_markdown(path, measurement, repetitions, revisions, results, skipped):
+    # Wall time on a shared runner is shown but never flagged.
+    metrics = [(measurement.replace("-", " "), lambda run: run["primary"], True)]
+    if all("foreground allocations" in run["secondaries"]
+           for pair in results.values() for side in pair for run in side):
+        metrics.append(("foreground allocations",
+                        lambda run: run["secondaries"]["foreground allocations"], True))
+    metrics.append(("wall time", lambda run: run["secondaries"]["wall time"], False))
+    flagged = []
+    rows = []
+    for identifier, pair in results.items():
+        cells = []
+        for name, value, judged in metrics:
+            runs = [[value(run) for run in side] for side in pair]
+            outcome = verdict(*runs) if judged else ""
+            if outcome:
+                flagged.append((identifier, name, runs, outcome))
+            cells.append(f"{change(*runs):+.2f}%" + (f" **{outcome}**" if outcome else ""))
+        rows.append(f"| `{identifier}` | " + " | ".join(cells) + " |")
+    baseline, candidate = revisions
+    regressions = sum(outcome == "regression" for *_, outcome in flagged)
+    lines = [
+        "## GPUI benchmark comparison",
+        "",
+        f"Baseline `{baseline['commit'][:12]}`, candidate `{candidate['commit'][:12]}`, "
+        f"{len(results)} cases, {repetitions} runs per case and revision.",
+        "",
+        f"A change is flagged when it exceeds {FLAG_PERCENT:g}% and {FLAG_NOISE_MULTIPLE:g} times "
+        "the run-to-run spread of either side. Wall time is not flagged, because shared runners "
+        "are too noisy to judge it.",
+        "",
+    ]
+    if skipped:
+        lines += ["Skipped, because Criterion can't analyze a zero measurement: "
+                  + ", ".join(f"`{identifier}`" for identifier in skipped) + ".", ""]
+    if flagged:
+        lines += [
+            f"**Regressions: {regressions}. Improvements: {len(flagged) - regressions}.**",
+            "",
+            "| Benchmark | Metric | Baseline | Candidate | Change | Spread B/N | Verdict |",
+            "|---|---|---:|---:|---:|---:|---|",
+        ]
+        for identifier, name, runs, outcome in flagged:
+            baseline_value, candidate_value = map(statistics.median, runs)
+            lines.append(
+                f"| `{identifier}` | {name} | {baseline_value:,.0f} | {candidate_value:,.0f} | "
+                f"{change(*runs):+.2f}% | {spread(runs[0]):.2f}/{spread(runs[1]):.2f}% | {outcome} |"
+            )
+    else:
+        lines.append("**No flagged changes.**")
+    lines += [
+        "",
+        "<details><summary>All cases</summary>",
+        "",
+        "| Benchmark | " + " | ".join(name for name, *_ in metrics) + " |",
+        "|---|" + "---:|" * len(metrics),
+        *rows,
+        "",
+        "</details>",
+        "",
+    ]
+    path.write_text("\n".join(lines))
 
 
 def main():
@@ -236,6 +354,7 @@ def main():
     parser.add_argument("baseline")
     parser.add_argument("candidate")
     parser.add_argument("--filter", help="Criterion regex, applied to all three binaries")
+    parser.add_argument("--exclude", help="regex of selected benchmark IDs to leave out")
     parser.add_argument("--full", action="store_true")
     parser.add_argument("--slow", action="store_true")
     parser.add_argument("--repetitions", type=int, default=3)
@@ -245,11 +364,19 @@ def main():
                                                 "darwin": "bench-support,font-kit"}.get(
                                                     sys.platform, "bench-support"))
     parser.add_argument("--timeout", type=int, default=300,
-                        help="hard timeout for EACH build/run, at most 300 seconds")
+                        help="hard timeout for EACH run, at most 300 seconds")
+    parser.add_argument("--build-timeout", type=int, default=300,
+                        help="hard timeout for EACH build, in seconds; cold CI builds need more")
+    parser.add_argument("--measurement", default="foreground-instructions",
+                        choices=["foreground-instructions", "instructions",
+                                 "foreground-allocations", "allocations", "auto"])
+    parser.add_argument("--markdown", type=Path, help="write a report with flagged changes")
     parser.add_argument("--cache", type=Path)
     args = parser.parse_args()
     if not 1 <= args.timeout <= 300 or args.repetitions < 1 or args.seed < 0:
         parser.error("timeout must be 1..300, repetitions positive and seed nonnegative")
+    if args.build_timeout < 1:
+        parser.error("build timeout must be positive")
     if args.filter and args.full:
         parser.error("--filter and --full are mutually exclusive")
     if "bench-support" not in args.features.split(",") or "test-support" in args.features:
@@ -264,14 +391,20 @@ def main():
         raise RuntimeError(f"another comparison is using {cache}") from error
     output = cache / "runs" / time.strftime("%Y%m%d-%H%M%S")
     output.mkdir(parents=True, exist_ok=False)
-    environment = dict(os.environ, BENCH_MEASUREMENT="foreground-instructions",
+    environment = dict(os.environ, BENCH_MEASUREMENT=args.measurement,
                        SEED=str(args.seed), ITERATIONS="1")
     environment["PATH"] = str(Path.home() / ".cargo/bin") + os.pathsep + environment["PATH"]
     revisions = []
     for revision in [args.baseline, args.candidate]:
         print(f"Building {revision} (once)...", flush=True)
-        revisions.append(prepare(root, cache, revision, args.features, args.timeout, environment))
+        revisions.append(prepare(root, cache, revision, args.features, args.timeout,
+                                 args.build_timeout, environment))
     verify_distinct_artifacts(revisions)
+    if args.measurement == "auto":
+        args.measurement = resolve_measurement(revisions[0]["binaries"][TARGETS[0]], output,
+                                               environment, args.timeout)
+        print(f"Measurement: {args.measurement}", flush=True)
+        environment["BENCH_MEASUREMENT"] = args.measurement
     if revisions[0]["lockfile_sha256"] != revisions[1]["lockfile_sha256"]:
         print("NOTE: revisions have different Cargo.lock files; dependency changes may affect results.")
     cases = {}
@@ -286,7 +419,8 @@ def main():
                              if line.endswith(": benchmark")])
         if listings[0] != listings[1]:
             raise RuntimeError(f"benchmark IDs differ for {target}")
-        cases[target] = listings[0]
+        cases[target] = [identifier for identifier in listings[0]
+                         if not (args.exclude and re.search(args.exclude, identifier))]
     if not any(cases.values()):
         raise RuntimeError("filter selected no benchmarks")
     # Verify all selected paths once; exercise Criterion's quick path before sampling.
@@ -302,42 +436,51 @@ def main():
                      "--measurement-time", "0.3"], cwd=output, environment=environment,
                     log=output / f"smoke-{index}-{target}{mode}.log", timeout=args.timeout)
     results = {}
-    print("Measuring sequentially; instructions are foreground retired instructions per frame/operation.",
+    skipped = []
+    scale, unit =(1e6, " M") if "instructions" in args.measurement else (1, "")
+    print(f"Measuring sequentially; values are {args.measurement.replace('-', ' ')} per frame/operation.",
           flush=True)
-    print(f"{'benchmark':76} {'base M':>9} {'new M':>9} {'change':>9} "
+    print(f"{'benchmark':76} {'base' + unit:>9} {'new' + unit:>9} {'change':>9} "
           f"{'spread B/N':>14} {'wall ms B/N':>17} {'run s B/N':>13}", flush=True)
     for target, identifiers in cases.items():
         for identifier in identifiers:
             pair = [[], []]
-            case_number = len(results)
-            for repetition in range(args.repetitions):
-                for index in ([0, 1] if repetition % 2 == 0 else [1, 0]):
-                    revision = revisions[index]
-                    directory = output / f"{case_number:03}-{repetition}-{index}"
-                    pair[index].append(measure(revision["binaries"][target], identifier, directory,
-                                               environment, args.timeout, args.slow))
+            case_number = len(results) + len(skipped)
+            try:
+                for repetition in range(args.repetitions):
+                    for index in ([0, 1] if repetition % 2 == 0 else [1, 0]):
+                        revision = revisions[index]
+                        directory = output / f"{case_number:03}-{repetition}-{index}"
+                        pair[index].append(measure(revision["binaries"][target], identifier,
+                                                   directory, environment, args.timeout, args.slow))
+            except ZeroMeasurement as error:
+                print(f"{identifier:76} skipped: {error}", flush=True)
+                skipped.append(identifier)
+                continue
             results[identifier] = pair
-            instruction_runs = [[value["instructions"] for value in side] for side in pair]
-            baseline, candidate = map(statistics.median, instruction_runs)
-            walls = [statistics.median(value["wall_seconds"] for value in side) * 1000 for side in pair]
+            primary_runs = [[value["primary"] for value in side] for side in pair]
+            baseline, candidate = map(statistics.median, primary_runs)
+            walls = [statistics.median(value["secondaries"]["wall time"] for value in side) * 1000
+                     for side in pair]
             durations = [statistics.median(value["elapsed_seconds"] for value in side) for side in pair]
-            noise = (f"{spread(instruction_runs[0]):5.2f}/{spread(instruction_runs[1]):5.2f}%"
+            noise = (f"{spread(primary_runs[0]):5.2f}/{spread(primary_runs[1]):5.2f}%"
                      if args.repetitions > 1 else "           n/a")
-            print(f"{identifier:76} {baseline / 1e6:9.3f} {candidate / 1e6:9.3f} "
-                  f"{(candidate / baseline - 1) * 100:+8.2f}% "
+            print(f"{identifier:76} {baseline / scale:9.3f} {candidate / scale:9.3f} "
+                  f"{change(*primary_runs):+8.2f}% "
                   f"{noise} "
                   f"{walls[0]:7.3f}/{walls[1]:7.3f} "
                   f"{durations[0]:5.2f}/{durations[1]:5.2f}", flush=True)
-            if args.repetitions > 1 and any(spread(values) > 1 for values in instruction_runs):
-                print("  NOTE: >1% instruction spread; confirm this case with --slow before judging a change.",
+            if args.repetitions > 1 and any(spread(values) > 1 for values in primary_runs):
+                print("  NOTE: >1% spread; confirm this case with --slow before judging a change.",
                       flush=True)
             sample_ranges = [
-                max((value["sample_max"] - value["sample_min"]) / value["instructions"] * 100
+                max((value["sample_max"] - value["sample_min"]) / value["primary"] * 100
+                    if value["primary"] else 0.0
                     for value in side)
                 for side in pair
             ]
             if any(value > 1 for value in sample_ranges):
-                print(f"  NOTE: within-run instruction sample range B/N "
+                print(f"  NOTE: within-run sample range B/N "
                       f"{sample_ranges[0]:.2f}/{sample_ranges[1]:.2f}%; "
                       "inspect raw samples for drift/outliers before judging a change.", flush=True)
             summary = {
@@ -345,6 +488,7 @@ def main():
                 "revisions": [{key: value for key, value in revision.items() if key != "binaries"}
                               for revision in revisions],
                 "results": results,
+                "skipped": skipped,
                 "cases": cases,
                 "environment": {name: value for name, value in environment.items()
                                 if name in ("BENCH_MEASUREMENT", "SEED", "ITERATIONS",
@@ -357,10 +501,14 @@ def main():
               f"measured processes {seconds:.2f}s ({args.repetitions} runs/case)")
         for target, identifiers in cases.items():
             seconds = sum(value["elapsed_seconds"] for identifier in identifiers
-                          for value in results[identifier][index])
+                          if identifier in results for value in results[identifier][index])
             print(f"  {target}: {seconds:.2f}s")
     print(f"Total including builds, discovery, smoke and quick checks: {time.monotonic() - started:.2f}s")
     print(f"Raw samples, frame reports and summary: {output}")
+    if args.markdown:
+        write_markdown(args.markdown, args.measurement, args.repetitions, revisions, results,
+                       skipped)
+        print(f"Markdown report: {args.markdown}")
 
 
 if __name__ == "__main__":
