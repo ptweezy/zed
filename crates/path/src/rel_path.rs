@@ -311,23 +311,60 @@ impl PartialOrd for RelPath {
 impl Ord for RelPath {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Ranking `/` below every other byte orders paths by component.
-        const CHUNK: usize = 16;
         let rank = |byte: u8| if byte == b'/' { 0 } else { u16::from(byte) + 1 };
-        let (a, b) = (self.0.as_bytes(), other.0.as_bytes());
-        let len = a.len().min(b.len());
-        let mut offset = 0;
-        while offset + CHUNK <= len && a[offset..offset + CHUNK] == b[offset..offset + CHUNK] {
-            offset += CHUNK;
-        }
-        match a[offset..len]
+        let (left, right) = (self.0.as_bytes(), other.0.as_bytes());
+        let common_length = left.len().min(right.len());
+        let (left_prefix, right_prefix) = (&left[..common_length], &right[..common_length]);
+        let mut difference = left_prefix
+            .as_chunks::<16>()
+            .0
             .iter()
-            .zip(&b[offset..len])
-            .position(|(a, b)| a != b)
-        {
-            Some(ix) => rank(a[offset + ix]).cmp(&rank(b[offset + ix])),
-            None => a.len().cmp(&b.len()),
+            .zip(right_prefix.as_chunks().0)
+            .find_map(|(left_chunk, right_chunk)| first_difference(left_chunk, right_chunk));
+        if difference.is_none() && common_length % 16 != 0 {
+            // Every full chunk matched, so windows ending at `common_length`
+            // only re-read equal bytes before reaching the tail.
+            difference = if let (Some(left_chunk), Some(right_chunk)) =
+                (left_prefix.last_chunk::<16>(), right_prefix.last_chunk())
+            {
+                first_difference(left_chunk, right_chunk)
+            } else if let (Some(left_start), Some(right_start), Some(left_end), Some(right_end)) = (
+                left_prefix.first_chunk::<8>(),
+                right_prefix.first_chunk(),
+                left_prefix.last_chunk::<8>(),
+                right_prefix.last_chunk(),
+            ) {
+                first_difference(left_start, right_start)
+                    .or_else(|| first_difference(left_end, right_end))
+            } else {
+                left_prefix
+                    .iter()
+                    .zip(right_prefix)
+                    .find(|(left_byte, right_byte)| left_byte != right_byte)
+                    .map(|(left_byte, right_byte)| (*left_byte, *right_byte))
+            };
+        }
+        match difference {
+            Some((left_byte, right_byte)) => rank(left_byte).cmp(&rank(right_byte)),
+            None => left.len().cmp(&right.len()),
         }
     }
+}
+
+/// Returns the first pair of bytes at which `left` and `right` differ.
+fn first_difference<const N: usize>(left: &[u8; N], right: &[u8; N]) -> Option<(u8, u8)> {
+    // `from_le_bytes` reads the bytes as little-endian on every target, so the
+    // lowest set bit of the XOR falls in the first differing byte. For 8 bytes,
+    // LLVM narrows the `u128` to a `u64`.
+    let word = |bytes: &[u8; N]| {
+        let mut word = [0; 16];
+        word[..N].copy_from_slice(bytes);
+        u128::from_le_bytes(word)
+    };
+    let difference = word(left) ^ word(right);
+    // `% N` lets the compiler drop the bounds checks.
+    let index = difference.trailing_zeros() as usize / 8 % N;
+    (difference != 0).then(|| (left[index], right[index]))
 }
 
 impl fmt::Debug for RelPath {
@@ -660,6 +697,14 @@ mod tests {
             "日本/語",
             "x/a.b/c",
             "x/a/b",
+            // 16 bytes long, so that pairs differ inside a full chunk: at its
+            // first byte, and at a `/`.
+            "a/cdefghijklmnop",
+            "A/cdefghijklmnop",
+            "a.bdefghijklmnop",
+            // 8 to 15 bytes in common, differing only after the first 8.
+            "a/cdefgh.j",
+            "a/cdefgh/j",
         ];
         // Long prefixes make `cmp` compare 16-byte chunks.
         for prefix in [
