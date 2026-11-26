@@ -7,8 +7,9 @@ on:
 permissions:
   contents: read
 env:
-  # main, and zed-industries/zed#67122 applied to it. `previous` is the PR
-  # before it compared short tails with 8-byte windows.
+  # `before` is main. `previous` is zed-industries/zed#67122 (its rel_path.rs
+  # matches b8be4f14bb apart from comments). `after` is a follow-up that was
+  # not kept.
   BEFORE_COMMIT: a3ce8d5e88e35697b2ba1cf9cb3c6816089b8281
   AFTER_COMMIT: 0c2306ef3b01ea6e073a6a157b395b44f1f7bee5
   SOURCE: crates/path/src/rel_path.rs
