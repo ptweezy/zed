@@ -464,8 +464,8 @@ pub enum UpstreamTracking {
     /// Remote ref present in local repository (fetched from remote).
     Tracked(UpstreamTrackingStatus),
     /// Not counted: listing branches counts only the checked-out branch, if it can. The key changes
-    /// with the upstream's object, the shallow boundary, and grafts, so that the branch then
-    /// compares unequal.
+    /// with the upstream's object, the shallow boundary, grafts, and replace refs, so that the
+    /// branch then compares unequal.
     Unknown(u64),
 }
 
@@ -2195,6 +2195,13 @@ impl GitRepository for RealGitRepository {
                     });
                     (ref_name, read)
                 });
+                // Replace refs change the history that counts walk. Reading them can mean scanning
+                // a large `packed-refs`, so it runs alongside the listing too.
+                let replace_refs = executor.spawn({
+                    let git = git.clone();
+                    let common_dir = common_dir.clone();
+                    async move { read_replace_refs(&git, &common_dir).await }
+                });
                 let output = git.build_command(&args).output().await?;
 
                 let mut errors = Vec::new();
@@ -2218,6 +2225,7 @@ impl GitRepository for RealGitRepository {
                     output.status.success(),
                     head,
                     guessed_head_read,
+                    replace_refs,
                     &mut errors,
                 )
                 .await;
@@ -4320,8 +4328,9 @@ fn parse_upstream_track(upstream_track: &str) -> Result<UpstreamTracking> {
 
 /// Each listed ref's upstream tracking, or `None` if it has no upstream. Only the checked-out
 /// branch, `head`, gets git's `%(upstream:track)`, which walks history. The others get `Unknown`,
-/// keyed by their upstream's object, the shallow boundary, and grafts, so that they still compare
-/// unequal after a change that only their counts would have shown, such as their upstream moving.
+/// keyed by their upstream's object, the shallow boundary, grafts, and replace refs, so that they
+/// still compare unequal after a change that only their counts would have shown, such as their
+/// upstream moving.
 async fn track_upstreams(
     git: &GitBinary,
     common_dir: &Path,
@@ -4329,6 +4338,7 @@ async fn track_upstreams(
     listing_succeeded: bool,
     head: Option<&ListedRef<'_>>,
     guessed_head_read: Option<(Vec<u8>, impl Future<Output = Result<Vec<u8>>>)>,
+    replace_refs: impl Future<Output = Result<Vec<u8>>>,
     errors: &mut Vec<String>,
 ) -> Vec<Option<UpstreamTracking>> {
     // The read that started alongside the listing is awaited only if it's of the checked-out
@@ -4340,9 +4350,8 @@ async fn track_upstreams(
         .iter()
         .map(|listed_ref| (listed_ref.ref_name, listed_ref.object_id))
         .collect::<HashMap<_, _>>();
-    // An upstream under `refs/heads/` or `refs/remotes/` that a complete listing lacks is gone, or
-    // listed under another case on file systems that ignore case, so its changes show in the
-    // listing anyway. The others are listed by name, and git lists only refs under `refs/`.
+    // A complete listing has every ref under `refs/heads/` and `refs/remotes/` by its exact name.
+    // Other upstreams are listed by name, and git lists only refs under `refs/`.
     let mut unlisted_upstreams = listed_refs
         .iter()
         .map(|listed_ref| listed_ref.upstream)
@@ -4357,11 +4366,12 @@ async fn track_upstreams(
     unlisted_upstreams.sort_unstable();
     unlisted_upstreams.dedup();
 
-    let (head_tracking, unlisted_refs, shallow, grafts) = futures::join!(
+    let (head_tracking, unlisted_refs, shallow, grafts, replace_refs) = futures::join!(
         OptionFuture::from(head.map(|head| read_head_tracking(git, head, guessed_head_read))),
         read_refs(git, &unlisted_upstreams),
         smol::fs::read(common_dir.join("shallow")),
         smol::fs::read(common_dir.join("info/grafts")),
+        replace_refs,
     );
     let mut report = |error: anyhow::Error| {
         let error = format!("failed to get upstream tracking: {error:#}");
@@ -4373,9 +4383,25 @@ async fn track_upstreams(
     let unlisted_refs = unlisted_refs.map_err(&mut report).unwrap_or_default();
     let unlisted_refs = listed_fields(&unlisted_refs).into_iter();
     objects.extend(unlisted_refs.map(|[ref_name, object_id]| (ref_name, object_id)));
+    let unresolved_upstreams = listed_refs
+        .iter()
+        .map(|listed_ref| listed_ref.upstream)
+        .filter(|upstream| !upstream.is_empty() && !objects.contains_key(upstream))
+        .collect::<HashSet<_>>();
+    let resolved_upstreams = futures::future::join_all(
+        unresolved_upstreams
+            .into_iter()
+            .map(async |upstream| (upstream, resolve_upstream(git, common_dir, upstream).await)),
+    )
+    .await;
+    let resolved_upstreams = resolved_upstreams
+        .iter()
+        .filter_map(|(upstream, object_id)| Some((*upstream, object_id.as_deref()?)));
+    objects.extend(resolved_upstreams);
 
     let mut history = DefaultHasher::new();
-    (shallow.ok(), grafts.ok()).hash(&mut history);
+    let replace_refs = replace_refs.map_err(&mut report).unwrap_or_default();
+    (shallow.ok(), grafts.ok(), replace_refs).hash(&mut history);
     listed_refs
         .iter()
         .map(|listed_ref| {
@@ -4420,12 +4446,21 @@ async fn read_head_tracking(
 async fn read_upstream_tracking(git: &GitBinary, ref_name: &[u8]) -> Result<Vec<u8>> {
     let ref_name = ref_name_argument(ref_name)?;
     let format = "--format=%(refname)%00%(objectname)%00%(upstream)%00%(upstream:track)%00";
-    let mut command =
-        git.build_command(&[OsStr::new("for-each-ref"), OsStr::new(format), ref_name]);
-    command.kill_on_drop(true);
-    let output = command.output().await?;
-    anyhow::ensure!(output.status.success(), format_branch_scan_error(&output));
-    Ok(output.stdout)
+    let args = [OsStr::new("for-each-ref"), OsStr::new(format), ref_name];
+    let read = async |config: &[(&str, &str)]| {
+        let mut command = git.build_command_with_config(config, &args);
+        command.kill_on_drop(true);
+        let output = command.output().await?;
+        anyhow::ensure!(output.status.success(), format_branch_scan_error(&output));
+        anyhow::Ok(output.stdout)
+    };
+    let output = read(&[]).await?;
+    // Git on macOS converts its arguments to precomposed Unicode, which then match no ref whose
+    // name `packed-refs` or a reftable stores decomposed, as the listing prints it.
+    if cfg!(target_os = "macos") && output.is_empty() && !ref_name.is_ascii() {
+        return read(&[("core.precomposeUnicode", "false")]).await;
+    }
+    Ok(output)
 }
 
 fn ref_name_argument(ref_name: &[u8]) -> Result<&OsStr> {
@@ -4434,6 +4469,46 @@ fn ref_name_argument(ref_name: &[u8]) -> Result<&OsStr> {
     #[cfg(not(unix))]
     let ref_name = OsStr::new(std::str::from_utf8(ref_name).context("the ref's name isn't UTF-8")?);
     Ok(ref_name)
+}
+
+/// The object of an upstream that git didn't list but still resolves: a root ref, such as
+/// `ORIG_HEAD`, or a loose ref that a file system that ignores case finds under another case.
+/// `git show-ref --verify` reads a ref as git does when it counts.
+async fn resolve_upstream(git: &GitBinary, common_dir: &Path, upstream: &[u8]) -> Option<Vec<u8>> {
+    let name = ref_name_argument(upstream).ok()?;
+    let is_root_ref = upstream.first().is_some_and(u8::is_ascii_uppercase)
+        && upstream
+            .iter()
+            .all(|&byte| matches!(byte, b'A'..=b'Z' | b'_' | b'-'));
+    let is_loose_ref = async || {
+        upstream.starts_with(b"refs/") && smol::fs::metadata(common_dir.join(name)).await.is_ok()
+    };
+    if !is_root_ref && !is_loose_ref().await {
+        return None;
+    }
+    let args = [OsStr::new("show-ref"), OsStr::new("--verify"), name];
+    let output = git.build_command(&args).output().await.ok()?;
+    let object_id = output.stdout.split(|&byte| byte == b' ').next()?;
+    output.status.success().then(|| object_id.to_vec())
+}
+
+/// Lists the replace refs, which change the history that counts walk, followed by the config,
+/// which can turn them off. Git lists them only if the ref store may have some.
+async fn read_replace_refs(git: &GitBinary, common_dir: &Path) -> Result<Vec<u8>> {
+    let exists = async |path| smol::fs::metadata(common_dir.join(path)).await.is_ok();
+    let packed_refs = smol::fs::read(common_dir.join("packed-refs")).await;
+    let packed_replace_ref = b" refs/replace/";
+    let packed = packed_refs.is_ok_and(|refs| {
+        refs.windows(packed_replace_ref.len())
+            .any(|window| window == packed_replace_ref)
+    });
+    if !packed && !exists("refs/replace").await && !exists("reftable").await {
+        return Ok(Vec::new());
+    }
+    let mut replace_refs = read_refs(git, &[b"refs/replace/"]).await?;
+    let config = smol::fs::read(common_dir.join("config")).await;
+    replace_refs.extend(config.unwrap_or_default());
+    Ok(replace_refs)
 }
 
 /// Lists the refs named `names`, each with its object. Git matches the names against those of its
@@ -6615,6 +6690,7 @@ mod tests {
         git(path, "commit --allow-empty -m first");
         git(path, "branch tracks_tag");
         git(path, "branch tracks_remote_tag");
+        git(path, "branch tracks_original");
         git(path, "commit --allow-empty -m second");
         let middle = git(path, "rev-parse HEAD");
         git(path, "commit --allow-empty -m third");
@@ -6627,14 +6703,23 @@ mod tests {
         git(path, "remote add origin .");
         git(path, "update-ref refs/remotes/origin/v1 v1");
         git(path, "branch --set-upstream-to=origin/v1 tracks_remote_tag");
+        git(path, "update-ref ORIG_HEAD tracks_original");
+        git(path, "config branch.tracks_original.remote .");
+        git(path, "config branch.tracks_original.merge ORIG_HEAD");
 
         let repo = open_repo(path, cx);
         let mut previous = repo.branches().await.unwrap();
+        // Main compared git's counts for every branch, so a change must change them too.
+        let counts = || git(path, "for-each-ref --format=%(upstream:track) refs/heads");
+        let mut previous_counts = counts();
         let mut assert_branches_changed = async |changed: bool, change: &str| {
             let branches = repo.branches().await.unwrap();
+            let counts = counts();
             assert_eq!(branches.error, None, "{change}");
+            assert_eq!(counts != previous_counts, changed, "git's counts: {change}");
             assert_eq!(branches.branches != previous.branches, changed, "{change}");
             previous = branches;
+            previous_counts = counts;
         };
         assert_branches_changed(false, "listed again").await;
         git(path, "tag --force base main");
@@ -6646,6 +6731,8 @@ mod tests {
         git(path, "tag -a --force v1 -m v1 main");
         git(path, "update-ref refs/remotes/origin/v1 v1");
         assert_branches_changed(true, "moved a remote ref to a tag").await;
+        git(path, "update-ref ORIG_HEAD main");
+        assert_branches_changed(true, "moved ORIG_HEAD").await;
 
         // No branch points to this commit, so cutting it off from its parent only changes the
         // commits between the branches and their upstreams.
@@ -6656,6 +6743,54 @@ mod tests {
         fs::create_dir_all(path.join(".git/info")).unwrap();
         fs::write(path.join(".git/info/grafts"), format!("{middle}\n")).unwrap();
         assert_branches_changed(true, "added a graft").await;
+        fs::remove_file(path.join(".git/info/grafts")).unwrap();
+        assert_branches_changed(true, "removed the graft").await;
+        git(path, &format!("replace --graft {middle}"));
+        assert_branches_changed(true, "added a replace ref").await;
+        git(path, "pack-refs --all");
+        assert_branches_changed(false, "packed the replace ref").await;
+        git(path, "config core.useReplaceRefs false");
+        assert_branches_changed(true, "turned replace refs off").await;
+        git(path, "config --unset core.useReplaceRefs");
+        assert_branches_changed(true, "turned replace refs on").await;
+        git(path, &format!("replace -d {middle}"));
+        assert_branches_changed(true, "deleted a packed replace ref").await;
+    }
+
+    #[gpui::test]
+    async fn test_branches_differ_after_an_upstream_under_another_case_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let repo_dir = init_test_repo(cx);
+        let path = repo_dir.path();
+        // Only file systems that ignore case find a loose ref under another case.
+        if git(path, "config --get --default false core.ignoreCase") != "true" {
+            return;
+        }
+        git(path, "commit --allow-empty -m first");
+        git(path, "branch tracks_tag");
+        git(path, "branch tracks_remote");
+        git(path, "commit --allow-empty -m second");
+        git(path, "tag base tracks_tag");
+        git(path, "config branch.tracks_tag.remote .");
+        git(path, "config branch.tracks_tag.merge refs/tags/BASE");
+        git(path, "remote add origin .");
+        git(path, "update-ref refs/remotes/origin/base tracks_remote");
+        git(path, "config branch.tracks_remote.remote origin");
+        git(path, "config branch.tracks_remote.merge refs/heads/BASE");
+
+        let repo = open_repo(path, cx);
+        let branches = repo.branches().await.unwrap().branches;
+        git(path, "tag --force base main");
+        let moved = repo.branches().await.unwrap().branches;
+        assert_ne!(moved, branches, "moved the tag");
+        // Git doesn't find a packed ref under another case.
+        git(path, "pack-refs --all");
+        assert_ne!(
+            repo.branches().await.unwrap().branches,
+            moved,
+            "packed the refs"
+        );
     }
 
     #[gpui::test]
@@ -6754,6 +6889,25 @@ mod tests {
         let branches = repo.branches().await.unwrap().branches;
         git_bytes(b"update-ref refs/custom/topic\xe9 main");
         assert_ne!(repo.branches().await.unwrap().branches, branches);
+    }
+
+    // Only git on macOS converts its arguments to precomposed Unicode.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn test_branches_upstream_tracking_decomposed_ref_name(cx: &mut TestAppContext) {
+        let repo_dir = init_test_repo(cx);
+        let path = repo_dir.path();
+        git(path, "commit --allow-empty -m first");
+        git(path, "commit --allow-empty -m second");
+        // Packed without precomposing, the head's name stays decomposed.
+        git(path, "config core.precomposeUnicode false");
+        git(path, "checkout -b cafe\u{301} main~1");
+        git(path, "branch --set-upstream-to=main");
+        git(path, "pack-refs --all");
+        git(path, "config core.precomposeUnicode true");
+        let repo = open_repo(path, cx);
+        assert_head_upstream(&repo, "refs/heads/main", tracked(0, 1)).await;
+        assert_head_upstream(&repo, "refs/heads/main", tracked(0, 1)).await;
     }
 
     fn parse_branches(listing: &str) -> Vec<Branch> {
