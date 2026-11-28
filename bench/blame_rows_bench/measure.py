@@ -38,6 +38,9 @@ def run(binary, test, fixture, visible_rows):
 
 
 def main():
+    # Windows runners default to cp1252, which cannot encode the arrows in the summary.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
     binaries_dir, fixtures_dir, summary_path, rounds = sys.argv[1:5]
     rounds = int(rounds)
     row_counts = [int(value) for value in sys.argv[5:]] or [60]
@@ -115,9 +118,9 @@ def main():
     summary.append("")
     summary.append("The variants returned the same blame in every run and in the interleaved-buffer check.")
     output = "\n".join(summary) + "\n"
-    print(output)
     with open(summary_path, "a", encoding="utf-8") as file:
         file.write(output)
+    print(output)
 
 
 main()
