@@ -1,0 +1,75 @@
+name: Measure sort-lines actions
+on:
+  push:
+    branches:
+      - bench-sort-lines-cached-key
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: ./script/linux
+      - name: Install lld
+        # .cargo/config.toml links with lld on aarch64 Linux.
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: sudo apt-get install -y lld
+      - name: Use the C drive for the target dir
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=C:\\zed-target" >> "$GITHUB_ENV"
+      - name: Describe the machine
+        shell: bash
+        run: |
+          uname -a
+          case "$RUNNER_OS" in
+            Linux) lscpu | head -20 ;;
+            macOS) sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize ;;
+            Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfLogicalProcessors" ;;
+          esac
+          df -h . || true
+      - name: Build both variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          binaries="$RUNNER_TEMP/binaries"
+          "$python" bench/sort_lines_bench/set_variant.py before
+          "$python" bench/sort_lines_bench/build_variant.py "$binaries/before$suffix"
+          "$python" bench/sort_lines_bench/set_variant.py after
+          "$python" bench/sort_lines_bench/build_variant.py "$binaries/after$suffix"
+          git checkout -- crates/editor/src/editor.rs
+          if cmp -s "$binaries/before$suffix" "$binaries/after$suffix"; then
+            echo "the two binaries are identical" >&2
+            exit 1
+          fi
+          ls -l "$binaries"
+          df -h . || true
+      - name: Measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=$(command -v python3 || command -v python)
+          "$python" bench/sort_lines_bench/measure.py "$RUNNER_TEMP/binaries" "$GITHUB_STEP_SUMMARY" 21 \
+            case_insensitive:ascii:10000 case_insensitive:ascii case_insensitive:german \
+            case_insensitive:cyrillic case_insensitive:cjk case_insensitive:ascii-sorted \
+            case_insensitive:short by_length:ascii
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sort-lines-${{ matrix.os }}
+          path: results.tsv
+          if-no-files-found: ignore
